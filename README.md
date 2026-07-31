@@ -96,7 +96,7 @@ gearlever-turbo -v           # Show every OK / SKIP row
 gearlever-turbo --check      # Show what would update (alias: --dry-run)
 gearlever-turbo --yes        # Update without confirmation prompt
 gearlever-turbo --topgrade   # Quiet + one summary line (Topgrade / automation)
-gearlever-turbo --self-update # Update this script from GitHub
+gearlever-turbo --self-update # Update this script from the latest GitHub release
 gearlever-turbo --quiet      # Quiet mode for cron / systemd timers
 gearlever-turbo --jobs 8 --connections 16
 gearlever-turbo --help
@@ -109,7 +109,7 @@ gearlever-turbo --help
 | `--verbose` / `-v` | Show every OK / SKIP row and extra plan detail |
 | `--quiet` / `-q` | Suppress progress; errors still go to stderr (also skips confirm) |
 | `--topgrade` | Implies `--quiet` + `--yes`; prints one summary line to stdout |
-| `--self-update` | Fetch latest script from GitHub `master` and replace this binary |
+| `--self-update` | Fetch latest *released* script from GitHub and replace this binary |
 | `--jobs` / `-j` | Parallel resolve workers and concurrent aria2 downloads (default: 4) |
 | `--connections` / `-x` | aria2 connections per server (default: 16) |
 | `--config-dir DIR` | Override GearLever config directory |

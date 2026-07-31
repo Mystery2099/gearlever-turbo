@@ -30,12 +30,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 GITHUB_REPO = "Mystery2099/gearlever-turbo"
 GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
-SELF_UPDATE_URL = (
-    f"https://raw.githubusercontent.com/{GITHUB_REPO}/master/gearlever-turbo"
-)
+GITHUB_API_LATEST_RELEASE = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 USER_AGENT = f"gearlever-turbo/{VERSION} (+{GITHUB_URL}; GearLever companion)"
 FLATPAK_APP_ID = "it.mijorus.gearlever"
 PARTIAL_SUFFIX = ".turbo-partial"
@@ -296,8 +294,29 @@ def parse_script_version(text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def resolve_self_update_download() -> tuple[str, str]:
+    """Return (download_url, release_label) for the latest GitHub release script."""
+    release = http_json(GITHUB_API_LATEST_RELEASE, headers=_github_headers())
+    tag = str(release.get("tag_name") or "").strip()
+    if not tag:
+        raise RuntimeError("latest GitHub release has no tag_name")
+
+    asset_url: Optional[str] = None
+    for asset in release.get("assets") or []:
+        if asset.get("name") == "gearlever-turbo" and asset.get("browser_download_url"):
+            asset_url = str(asset["browser_download_url"])
+            break
+
+    if asset_url:
+        return asset_url, tag
+
+    # Fallback when the release has no attached script asset
+    raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{tag}/gearlever-turbo"
+    return raw_url, tag
+
+
 def self_update(*, quiet: bool = False) -> int:
-    """Fetch the latest gearlever-turbo from GitHub and replace this script."""
+    """Fetch the latest released gearlever-turbo and replace this script."""
     target = Path(sys.argv[0]).resolve()
     if not target.is_file():
         log_err(f"Cannot self-update: script path is not a file ({target})")
@@ -315,10 +334,16 @@ def self_update(*, quiet: bool = False) -> int:
         log_err(f"Cannot read current script: {exc}")
         return EXIT_SETUP
 
-    if not quiet:
-        log(f"Fetching {SELF_UPDATE_URL} …")
     try:
-        _, _, remote_bytes = http_request(SELF_UPDATE_URL, timeout=60.0)
+        download_url, release_label = resolve_self_update_download()
+    except RuntimeError as exc:
+        log_err(f"Self-update failed: {exc}")
+        return EXIT_SETUP
+
+    if not quiet:
+        log(f"Fetching latest release ({release_label}) …")
+    try:
+        _, _, remote_bytes = http_request(download_url, timeout=60.0)
     except RuntimeError as exc:
         log_err(f"Self-update failed: {exc}")
         return EXIT_SETUP
@@ -333,7 +358,7 @@ def self_update(*, quiet: bool = False) -> int:
     remote_ver = parse_script_version(remote_bytes.decode("utf-8", errors="replace"))
 
     if local_hash == remote_hash:
-        msg = f"Already up to date (gearlever-turbo {local_ver})."
+        msg = f"Already up to date (gearlever-turbo {local_ver}, {release_label})."
         if quiet:
             print(msg, flush=True)
         else:
@@ -351,9 +376,9 @@ def self_update(*, quiet: bool = False) -> int:
         return EXIT_SETUP
 
     if remote_ver:
-        msg = f"Updated gearlever-turbo {local_ver} → {remote_ver}"
+        msg = f"Updated gearlever-turbo {local_ver} → {remote_ver} ({release_label})"
     else:
-        msg = f"Updated gearlever-turbo at {target}"
+        msg = f"Updated gearlever-turbo at {target} ({release_label})"
     if quiet:
         print(msg, flush=True)
     else:
@@ -1342,7 +1367,7 @@ def build_parser() -> argparse.ArgumentParser:
   gearlever-turbo -v               # Show every OK / SKIP row
   gearlever-turbo --yes            # Download without prompting
   gearlever-turbo --topgrade       # Quiet one-line summary (Topgrade / cron)
-  gearlever-turbo --self-update    # Update this script from GitHub
+  gearlever-turbo --self-update    # Update this script from latest GitHub release
   gearlever-turbo --quiet          # Silent (errors still printed)
 
 Environment:
@@ -1386,7 +1411,7 @@ Environment:
     p.add_argument(
         "--self-update",
         action="store_true",
-        help="Update this script from GitHub (master) and exit",
+        help="Update this script from the latest GitHub release and exit",
     )
     p.add_argument(
         "--verbose",
