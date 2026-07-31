@@ -1,0 +1,1191 @@
+#!/usr/bin/env python3
+"""gearlever-turbo — parallel AppImage update accelerator for GearLever.
+
+Companion script only: reads GearLever metadata, resolves updates concurrently,
+downloads with aria2c (or appimageupdatetool for embedded zsync), and replaces
+files where GearLever already expects them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import configparser
+import fnmatch
+import hashlib
+import json
+import os
+import platform
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+VERSION = "1.0.0"
+USER_AGENT = f"gearlever-turbo/{VERSION} (+https://github.com/mystery/gearlever-turbo; GearLever companion)"
+FLATPAK_APP_ID = "it.mijorus.gearlever"
+PARTIAL_SUFFIX = ".turbo-partial"
+ARIA2_INPUT_NAME = "gearlever-turbo-aria2.txt"
+
+EXIT_OK = 0
+EXIT_PARTIAL = 1
+EXIT_SETUP = 2
+
+RE_X86 = re.compile(r"(\-|\_|\.)x86(\-|\_|\.)")
+RE_ARM = re.compile(r"(\-|\_|\.)(arm64|aarch64|armv7l)(\-|\_|\.)")
+RE_GH_EMBEDDED = re.compile(r"gh-releases-zsync\|.*\.zsync")
+RE_STATIC_EMBEDDED = re.compile(r"\szsync\|http\S*")
+RE_SHA1 = re.compile(r"SHA-1:\s*([0-9a-f]{40})", re.I)
+RE_ZSYNC_URL = re.compile(r"URL:\s*(.*)")
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+_quiet = False
+
+
+def log(msg: str = "") -> None:
+    if not _quiet:
+        print(msg, flush=True)
+
+
+def log_err(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ManagedApp:
+    """One AppImage managed by GearLever."""
+
+    name: str
+    file_path: Path
+    app_hash: str
+    manager: Optional[str] = None
+    manager_config: dict[str, str] = field(default_factory=dict)
+    embedded_upd_info: Optional[str] = None
+    source_note: str = ""
+
+
+@dataclass
+class PendingUpdate:
+    """A resolved download / delta update ready to apply."""
+
+    app: ManagedApp
+    method: str  # "aria2" | "zsync"
+    download_url: Optional[str] = None
+    remote_size: Optional[int] = None
+    remote_name: Optional[str] = None
+    detail: str = ""
+
+
+@dataclass
+class ResolveResult:
+    app: ManagedApp
+    update: Optional[PendingUpdate] = None
+    error: Optional[str] = None
+    skipped: Optional[str] = None  # up-to-date or no source
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers (stdlib only)
+# ---------------------------------------------------------------------------
+
+
+def _github_headers() -> dict[str, str]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/vnd.github+json",
+    }
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def http_request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: Optional[dict[str, str]] = None,
+    timeout: float = 30.0,
+) -> tuple[int, dict[str, str], bytes]:
+    req_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        req_headers.update(headers)
+    request = urllib.request.Request(url, method=method, headers=req_headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            body = resp.read() if method.upper() != "HEAD" else b""
+            return status, resp_headers, body
+    except urllib.error.HTTPError as exc:
+        body = exc.read() if hasattr(exc, "read") else b""
+        resp_headers = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
+        if exc.code == 403 and b"rate limit" in body.lower():
+            raise RuntimeError(
+                "GitHub API rate limit exceeded. Set GITHUB_TOKEN or GH_TOKEN and retry."
+            ) from exc
+        raise RuntimeError(f"HTTP {exc.code} for {url}: {body[:200]!r}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error for {url}: {exc.reason}") from exc
+
+
+def http_json(url: str, *, headers: Optional[dict[str, str]] = None) -> Any:
+    _, _, body = http_request(url, headers=headers)
+    return json.loads(body.decode("utf-8"))
+
+
+def http_text(url: str) -> str:
+    _, _, body = http_request(url)
+    return body.decode("utf-8", errors="replace")
+
+
+def http_headers(url: str) -> dict[str, str]:
+    try:
+        _, headers, _ = http_request(url, method="HEAD")
+        return headers
+    except RuntimeError:
+        # Some hosts reject HEAD; fall back to a ranged/stream-style GET and close.
+        _, headers, _ = http_request(url, method="GET")
+        return headers
+
+
+# ---------------------------------------------------------------------------
+# GearLever config discovery (isolated — update this if GearLever changes)
+# ---------------------------------------------------------------------------
+
+
+def find_gearlever_config_dirs() -> list[Path]:
+    """Return candidate GearLever config directories, preferred first."""
+    home = Path.home()
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
+    candidates = [
+        home / ".var" / "app" / FLATPAK_APP_ID / "config",
+        xdg,
+        home / ".config",
+    ]
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in candidates:
+        resolved = path.resolve() if path.exists() else path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        conf = path / "gearlever.conf"
+        apps = path / "apps.json"
+        if conf.is_file() or apps.is_file():
+            result.append(path)
+    return result
+
+
+def parse_gearlever_apps(config_dir: Path) -> list[ManagedApp]:
+    """Parse GearLever's gearlever.conf + apps.json into ManagedApp list.
+
+    GearLever 4.x stores:
+      - gearlever.conf: [app.<md5(file_path)>] with name/file_path
+      - [app.<hash>.update_manager] with manager= and updater-specific keys
+      - apps.json: legacy v1 map keyed by base64(name) with update_url fields
+    Embedded update info lives in each AppImage's ELF .upd_info section.
+    """
+    conf_path = config_dir / "gearlever.conf"
+    apps_json_path = config_dir / "apps.json"
+
+    parser = configparser.ConfigParser(interpolation=None)
+    if conf_path.is_file():
+        parser.read(conf_path, encoding="utf-8")
+
+    legacy: dict[str, dict[str, Any]] = {}
+    if apps_json_path.is_file():
+        try:
+            raw = json.loads(apps_json_path.read_text(encoding="utf-8") or "{}")
+            if isinstance(raw, dict):
+                legacy = raw
+        except json.JSONDecodeError as exc:
+            log_err(f"Warning: could not parse {apps_json_path}: {exc}")
+
+    apps: list[ManagedApp] = []
+    for section in parser.sections():
+        if not section.startswith("app.") or section.endswith(".update_manager"):
+            continue
+        app_hash = section[len("app.") :]
+        data = dict(parser[section])
+        file_path_str = data.get("file_path", "").strip()
+        if not file_path_str:
+            continue
+        raw_name = data.get("name", Path(file_path_str).stem)
+        file_path = Path(file_path_str).expanduser()
+        name = desktop_name_for_path(file_path) or raw_name
+
+        um_section = f"app.{app_hash}.update_manager"
+        manager_config: dict[str, str] = {}
+        manager: Optional[str] = None
+        if parser.has_section(um_section):
+            manager_config = {k: v for k, v in parser[um_section].items()}
+            manager = manager_config.pop("manager", None) or None
+            # Drop noise keys that aren't updater settings
+            manager_config.pop("fetch-updates-in-background", None)
+
+        # Legacy apps.json (v1) fallback / migration data
+        if not manager:
+            legacy_entry = _legacy_entry_for_name(legacy, name) or _legacy_entry_for_name(
+                legacy, raw_name
+            )
+            if legacy_entry:
+                manager, manager_config = _manager_from_legacy(legacy_entry)
+
+        embedded = read_embedded_upd_info(file_path) if file_path.is_file() else None
+
+        # If still no configured manager, embedded info selects the updater type
+        if not manager and embedded:
+            if embedded.startswith("gh-releases-zsync|"):
+                manager = "GithubUpdater"
+            elif embedded.startswith("zsync|") or embedded.startswith("http"):
+                manager = "StaticFileUpdater"
+
+        source_parts: list[str] = []
+        if manager:
+            source_parts.append(manager)
+        if embedded:
+            source_parts.append("embedded")
+        if not manager and not embedded:
+            source_parts.append("none")
+
+        apps.append(
+            ManagedApp(
+                name=name,
+                file_path=file_path,
+                app_hash=app_hash,
+                manager=manager,
+                manager_config=manager_config,
+                embedded_upd_info=embedded,
+                source_note="+".join(source_parts),
+            )
+        )
+
+    return apps
+
+
+def _legacy_entry_for_name(
+    legacy: dict[str, dict[str, Any]], name: str
+) -> Optional[dict[str, Any]]:
+    b64 = base64.b64encode(name.encode("utf-8")).decode("ascii")
+    if b64 in legacy and isinstance(legacy[b64], dict):
+        return legacy[b64]
+    # Match by stored name field (names can drift slightly after renames)
+    for entry in legacy.values():
+        if isinstance(entry, dict) and entry.get("name") == name:
+            return entry
+    # Soft match: ignore parenthetical suffixes
+    base = re.sub(r"\s*\(.*?\)\s*$", "", name).strip().lower()
+    for entry in legacy.values():
+        if not isinstance(entry, dict):
+            continue
+        other = str(entry.get("name", ""))
+        other_base = re.sub(r"\s*\(.*?\)\s*$", "", other).strip().lower()
+        if base and base == other_base:
+            return entry
+    return None
+
+
+def _manager_from_legacy(entry: dict[str, Any]) -> tuple[Optional[str], dict[str, str]]:
+    manager = entry.get("update_url_manager") or entry.get("manager")
+    cfg: dict[str, str] = {}
+    umc = entry.get("update_manager_config") or {}
+    if isinstance(umc, dict):
+        for key, value in umc.items():
+            cfg[str(key)] = str(value).lower() if isinstance(value, bool) else str(value)
+
+    # Normalize GithubUpdater v1 shape → v2 keys used in gearlever.conf
+    if manager == "GithubUpdater":
+        if "repo" not in cfg and "repo_url" in cfg:
+            parts = urllib.parse.urlsplit(cfg["repo_url"]).path.strip("/").split("/")
+            if len(parts) >= 2:
+                cfg["repo"] = f"{parts[0]}/{parts[1]}"
+        if "repo_filename" not in cfg and entry.get("update_url"):
+            url_data = parse_github_url_pattern(str(entry["update_url"]))
+            if url_data:
+                cfg.setdefault("repo", f"{url_data['username']}/{url_data['repo']}")
+                cfg.setdefault("repo_filename", url_data["filename"])
+        if "allow_prereleases" in cfg:
+            cfg["allow_prereleases"] = (
+                "yes" if str(cfg["allow_prereleases"]).lower() in {"1", "true", "yes"} else "no"
+            )
+
+    if manager == "StaticFileUpdater" and "url" not in cfg and entry.get("update_url"):
+        cfg["url"] = str(entry["update_url"])
+
+    # Infer manager from update_url if missing
+    if not manager and entry.get("update_url"):
+        url = str(entry["update_url"])
+        gh = parse_github_url_pattern(url)
+        if gh:
+            manager = "GithubUpdater"
+            cfg.setdefault("repo", f"{gh['username']}/{gh['repo']}")
+            cfg.setdefault("repo_filename", gh["filename"])
+        elif url.startswith("http://") or url.startswith("https://"):
+            manager = "StaticFileUpdater"
+            cfg.setdefault("url", url)
+
+    return (str(manager) if manager else None), cfg
+
+
+def desktop_name_for_path(file_path: Path) -> Optional[str]:
+    """Best-effort friendly name from ~/.local/share/applications (GearLever desktop files)."""
+    apps_dir = Path.home() / ".local" / "share" / "applications"
+    if not apps_dir.is_dir():
+        return None
+    target = str(file_path.resolve()) if file_path.exists() else str(file_path)
+    try:
+        for desk in apps_dir.glob("*.desktop"):
+            try:
+                text = desk.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if target not in text and file_path.name not in text:
+                continue
+            for line in text.splitlines():
+                if line.startswith("Name=") and not line.startswith("Name["):
+                    value = line.split("=", 1)[1].strip()
+                    if value:
+                        return value
+    except OSError:
+        return None
+    return None
+
+
+def read_embedded_upd_info(file_path: Path) -> Optional[str]:
+    """Read AppImageSpec .upd_info (same approach as GearLever's UpdateManagerChecker)."""
+    if not file_path.is_file():
+        return None
+    readelf = shutil.which("readelf")
+    if not readelf:
+        return None
+    try:
+        proc = subprocess.run(
+            [readelf, "--string-dump=.upd_info", "--wide", str(file_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = (proc.stdout or "").replace("\n", " ") + " "
+    match = RE_GH_EMBEDDED.search(out)
+    if match:
+        return match.group(0).strip()
+    match = RE_STATIC_EMBEDDED.search(out)
+    if match:
+        return match.group(0).strip()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Update resolution (mirrors GearLever updater semantics)
+# ---------------------------------------------------------------------------
+
+
+def parse_github_url_pattern(url: str) -> Optional[dict[str, str]]:
+    """Parse GearLever-style GitHub release URL or gh-releases-zsync|... string."""
+    tag_name = "*"
+    if url.startswith("https://"):
+        parts = urllib.parse.urlsplit(url)
+        if parts.netloc != "github.com":
+            return None
+        paths = parts.path.split("/")
+        if len(paths) < 7 or paths[3] != "releases" or paths[4] != "download":
+            return None
+        url = f"|{paths[1]}|{paths[2]}|latest|{paths[6]}"
+        tag_name = paths[5]
+    elif url.startswith("gh-releases-zsync|"):
+        pass
+    else:
+        return None
+
+    items = url.split("|")
+    if len(items) != 5:
+        return None
+    return {
+        "username": items[1],
+        "repo": items[2],
+        "release": items[3],
+        "filename": items[4],
+        "tag_name": tag_name,
+    }
+
+
+def file_sha1(path: Path) -> str:
+    h = hashlib.sha1()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def pick_arch_asset(candidates: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        return None
+    arch = platform.machine()
+    if arch == "x86_64":
+        for asset in candidates:
+            name = asset.get("name", "")
+            if RE_X86.search(name) or not RE_ARM.search(name):
+                return asset
+    elif arch in {"aarch64", "arm64"}:
+        for asset in candidates:
+            if RE_ARM.search(asset.get("name", "")):
+                return asset
+    return candidates[0]
+
+
+def resolve_github(app: ManagedApp) -> ResolveResult:
+    update_data: Optional[dict[str, str]] = None
+    allow_prereleases = False
+    use_zsync_tool = False
+
+    if app.embedded_upd_info and app.embedded_upd_info.startswith("gh-releases-zsync|"):
+        update_data = parse_github_url_pattern(app.embedded_upd_info)
+        if update_data:
+            allow_prereleases = update_data["release"] in {"latest-pre", "latest-all"}
+            use_zsync_tool = True
+    else:
+        repo = app.manager_config.get("repo", "").strip()
+        filename = app.manager_config.get("repo_filename", "").strip()
+        parts = repo.split("/")
+        if len(parts) >= 2 and filename:
+            update_data = {
+                "username": parts[0],
+                "repo": parts[1],
+                "filename": filename,
+                "release": "latest",
+                "tag_name": "*",
+            }
+        allow_prereleases = app.manager_config.get("allow_prereleases", "no").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+    if not update_data:
+        return ResolveResult(app=app, skipped="incomplete GitHub update config")
+
+    # Prefer appimageupdatetool for embedded zsync AppImages
+    if use_zsync_tool and shutil.which("appimageupdatetool"):
+        available, detail = zsync_update_available(app.file_path)
+        if available is True:
+            return ResolveResult(
+                app=app,
+                update=PendingUpdate(
+                    app=app,
+                    method="zsync",
+                    detail=detail or "embedded zsync update available",
+                ),
+            )
+        if available is False:
+            return ResolveResult(app=app, skipped="up to date (zsync)")
+        # Fall through to full-download resolution if check failed
+
+    rel_url = (
+        f"https://api.github.com/repos/{update_data['username']}/"
+        f"{update_data['repo']}/releases"
+    )
+    if not allow_prereleases:
+        rel_url += "/latest"
+
+    try:
+        data = http_json(rel_url, headers=_github_headers())
+    except RuntimeError as exc:
+        return ResolveResult(app=app, error=str(exc))
+
+    releases = data if isinstance(data, list) else [data]
+    filename_pat = update_data["filename"]
+    chosen_release: Optional[dict[str, Any]] = None
+    possible: list[dict[str, Any]] = []
+
+    for release in releases:
+        if not allow_prereleases and release.get("draft"):
+            continue
+        possible = []
+        for asset in release.get("assets", []):
+            if fnmatch.fnmatch(asset.get("name", ""), filename_pat):
+                possible.append(asset)
+                if use_zsync_tool:
+                    break
+        if possible:
+            chosen_release = release
+            break
+
+    if not chosen_release or not possible:
+        return ResolveResult(app=app, skipped="no matching GitHub release asset")
+
+    tmp_target = pick_arch_asset(possible)
+    if not tmp_target:
+        return ResolveResult(app=app, skipped="no matching GitHub release asset")
+
+    is_zsync_name = tmp_target["name"].endswith(".zsync")
+    target_name = re.sub(r"\.zsync$", "", tmp_target["name"])
+    asset = None
+    zsync_asset = tmp_target if is_zsync_name else None
+    for candidate in chosen_release.get("assets", []):
+        if candidate.get("name") == target_name:
+            asset = candidate
+            break
+    if asset is None and not is_zsync_name:
+        asset = tmp_target
+    if asset is None:
+        return ResolveResult(app=app, skipped="AppImage asset missing next to .zsync")
+
+    # Update detection (GearLever-compatible)
+    if not app.file_path.is_file():
+        return ResolveResult(app=app, error=f"missing local file: {app.file_path}")
+
+    local_size = app.file_path.stat().st_size
+    if zsync_asset:
+        try:
+            zsync_text = http_text(zsync_asset["browser_download_url"])
+            header = zsync_text.split("\n\n", 1)[0]
+            match = RE_SHA1.search(header)
+            if match and match.group(1) == file_sha1(app.file_path):
+                return ResolveResult(app=app, skipped="up to date (zsync SHA-1)")
+        except RuntimeError as exc:
+            return ResolveResult(app=app, error=str(exc))
+    else:
+        digest = asset.get("digest") or ""
+        if isinstance(digest, str) and digest.startswith("sha256:"):
+            if digest == f"sha256:{file_sha256(app.file_path)}":
+                return ResolveResult(app=app, skipped="up to date (sha256)")
+        elif asset.get("size") == local_size:
+            return ResolveResult(app=app, skipped="up to date (size)")
+
+    return ResolveResult(
+        app=app,
+        update=PendingUpdate(
+            app=app,
+            method="aria2",
+            download_url=asset["browser_download_url"],
+            remote_size=asset.get("size"),
+            remote_name=asset.get("name"),
+            detail=f"GitHub {update_data['username']}/{update_data['repo']} → {asset.get('name')}",
+        ),
+    )
+
+
+def resolve_static(app: ManagedApp) -> ResolveResult:
+    embedded = app.embedded_upd_info
+    url = app.manager_config.get("url", "").strip()
+    zsync_url: Optional[str] = None
+
+    if embedded:
+        if embedded.startswith("zsync|"):
+            zsync_url = embedded[len("zsync|") :].strip()
+        elif embedded.startswith("http://") or embedded.startswith("https://"):
+            zsync_url = embedded.strip()
+
+    if zsync_url and shutil.which("appimageupdatetool"):
+        available, detail = zsync_update_available(app.file_path)
+        if available is True:
+            return ResolveResult(
+                app=app,
+                update=PendingUpdate(
+                    app=app,
+                    method="zsync",
+                    detail=detail or "embedded zsync update available",
+                ),
+            )
+        if available is False:
+            return ResolveResult(app=app, skipped="up to date (zsync)")
+
+    if zsync_url:
+        try:
+            zsync_text = http_text(zsync_url)
+        except RuntimeError as exc:
+            return ResolveResult(app=app, error=str(exc))
+        header = zsync_text.split("\n\n", 1)[0]
+        match = RE_SHA1.search(header)
+        if match and app.file_path.is_file() and match.group(1) == file_sha1(app.file_path):
+            return ResolveResult(app=app, skipped="up to date (zsync SHA-1)")
+        url_match = RE_ZSYNC_URL.search(header)
+        if url_match:
+            zsyncfile_url = url_match.group(1).strip()
+            if zsyncfile_url.startswith("http://") or zsyncfile_url.startswith("https://"):
+                url = zsyncfile_url
+            else:
+                parsed = urllib.parse.urlsplit(zsync_url)
+                joined = posixpath.join(posixpath.dirname(parsed.path), zsyncfile_url)
+                url = urllib.parse.urlunsplit(
+                    (parsed.scheme, parsed.netloc, joined, "", "")
+                )
+        else:
+            url = re.sub(r"\.zsync$", "", zsync_url)
+
+    if not url:
+        return ResolveResult(app=app, skipped="incomplete static URL config")
+
+    try:
+        headers = http_headers(url)
+    except RuntimeError as exc:
+        return ResolveResult(app=app, error=str(exc))
+
+    content_length = int(headers.get("content-length", "0") or "0")
+    if not app.file_path.is_file():
+        return ResolveResult(app=app, error=f"missing local file: {app.file_path}")
+    if content_length and content_length == app.file_path.stat().st_size:
+        return ResolveResult(app=app, skipped="up to date (size)")
+    if content_length == 0:
+        # Unknown size — still offer download when we have a URL from zsync
+        if not zsync_url:
+            return ResolveResult(app=app, skipped="remote size unknown; skipped")
+
+    return ResolveResult(
+        app=app,
+        update=PendingUpdate(
+            app=app,
+            method="aria2",
+            download_url=url,
+            remote_size=content_length or None,
+            remote_name=Path(urllib.parse.urlsplit(url).path).name or app.file_path.name,
+            detail=f"static URL → {url}",
+        ),
+    )
+
+
+def resolve_codeberg(app: ManagedApp) -> ResolveResult:
+    repo = app.manager_config.get("repo", "").strip().split("/")
+    filename = app.manager_config.get("repo_filename", "").strip()
+    if len(repo) < 2 or not filename:
+        return ResolveResult(app=app, skipped="incomplete Codeberg update config")
+
+    allow_prereleases = app.manager_config.get("allow_prereleases", "no").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    rel_url = f"https://codeberg.org/api/v1/repos/{repo[0]}/{repo[1]}/releases"
+    rel_url += "?draft=exclude" if allow_prereleases else "?pre-release=exclude&draft=exclude"
+
+    try:
+        releases = http_json(rel_url)
+    except RuntimeError as exc:
+        return ResolveResult(app=app, error=str(exc))
+    if not releases:
+        return ResolveResult(app=app, skipped="no Codeberg releases")
+
+    possible = [
+        a for a in releases[0].get("assets", []) if fnmatch.fnmatch(a.get("name", ""), filename)
+    ]
+    asset = pick_arch_asset(possible)
+    if not asset:
+        return ResolveResult(app=app, skipped="no matching Codeberg asset")
+    if app.file_path.is_file() and asset.get("size") == app.file_path.stat().st_size:
+        return ResolveResult(app=app, skipped="up to date (size)")
+
+    return ResolveResult(
+        app=app,
+        update=PendingUpdate(
+            app=app,
+            method="aria2",
+            download_url=asset["browser_download_url"],
+            remote_size=asset.get("size"),
+            remote_name=asset.get("name"),
+            detail=f"Codeberg {repo[0]}/{repo[1]} → {asset.get('name')}",
+        ),
+    )
+
+
+def resolve_forgejo(app: ManagedApp) -> ResolveResult:
+    repo_url = app.manager_config.get("repo_url", "").strip()
+    filename = app.manager_config.get("repo_filename", "").strip()
+    parts = urllib.parse.urlsplit(repo_url)
+    paths = parts.path.strip("/").split("/")
+    if len(paths) < 2 or not filename or not parts.netloc:
+        return ResolveResult(app=app, skipped="incomplete Forgejo update config")
+
+    allow_prereleases = app.manager_config.get("allow_prereleases", "no").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    api = f"https://{parts.netloc}/api/v1/repos/{paths[0]}/{paths[1]}/releases"
+    if not allow_prereleases:
+        api += "/latest"
+
+    try:
+        data = http_json(api)
+    except RuntimeError as exc:
+        return ResolveResult(app=app, error=str(exc))
+
+    if allow_prereleases:
+        release = next((r for r in data if not r.get("draft")), None)
+    else:
+        release = data
+    if not release:
+        return ResolveResult(app=app, skipped="no Forgejo release")
+
+    possible = [
+        a for a in release.get("assets", []) if fnmatch.fnmatch(a.get("name", ""), filename)
+    ]
+    asset = pick_arch_asset(possible)
+    if not asset:
+        return ResolveResult(app=app, skipped="no matching Forgejo asset")
+    if app.file_path.is_file() and asset.get("size") == app.file_path.stat().st_size:
+        return ResolveResult(app=app, skipped="up to date (size)")
+
+    return ResolveResult(
+        app=app,
+        update=PendingUpdate(
+            app=app,
+            method="aria2",
+            download_url=asset["browser_download_url"],
+            remote_size=asset.get("size"),
+            remote_name=asset.get("name"),
+            detail=f"Forgejo {parts.netloc}/{paths[0]}/{paths[1]} → {asset.get('name')}",
+        ),
+    )
+
+
+def resolve_gitlab(app: ManagedApp) -> ResolveResult:
+    repo_url = app.manager_config.get("repo_url", "").strip()
+    filename = app.manager_config.get("repo_filename", "").strip()
+    parts = urllib.parse.urlsplit(repo_url)
+    paths = [p for p in parts.path.split("/") if p]
+    if len(paths) < 2 or not filename or not parts.netloc:
+        return ResolveResult(app=app, skipped="incomplete GitLab update config")
+
+    # GearLever uses paths[1:4] joined — typically group/subgroup/project or user/project
+    project = "/".join(paths[:3]) if len(paths) >= 3 else "/".join(paths[:2])
+    api = (
+        f"https://{parts.netloc}/api/v4/projects/"
+        f"{urllib.parse.quote(project, safe='')}/releases"
+    )
+    try:
+        releases = http_json(api)
+    except RuntimeError as exc:
+        return ResolveResult(app=app, error=str(exc))
+    if not releases:
+        return ResolveResult(app=app, skipped="no GitLab releases")
+
+    links = releases[0].get("assets", {}).get("links", [])
+    possible = [a for a in links if fnmatch.fnmatch(a.get("name", ""), filename)]
+    asset = pick_arch_asset(possible)
+    if not asset:
+        return ResolveResult(app=app, skipped="no matching GitLab asset")
+
+    download_url = asset.get("direct_asset_url") or asset.get("url")
+    if not download_url:
+        return ResolveResult(app=app, skipped="GitLab asset has no download URL")
+
+    try:
+        headers = http_headers(download_url)
+        remote_size = int(headers.get("content-length", "0") or "0")
+    except RuntimeError as exc:
+        return ResolveResult(app=app, error=str(exc))
+
+    if remote_size and app.file_path.is_file() and remote_size == app.file_path.stat().st_size:
+        return ResolveResult(app=app, skipped="up to date (size)")
+
+    return ResolveResult(
+        app=app,
+        update=PendingUpdate(
+            app=app,
+            method="aria2",
+            download_url=download_url,
+            remote_size=remote_size or None,
+            remote_name=asset.get("name"),
+            detail=f"GitLab {project} → {asset.get('name')}",
+        ),
+    )
+
+
+def resolve_app(app: ManagedApp) -> ResolveResult:
+    if not app.file_path.is_file():
+        return ResolveResult(app=app, error=f"AppImage not found: {app.file_path}")
+
+    # Embedded zsync without a configured manager still routes here via manager set in parse
+    manager = app.manager
+    if not manager:
+        return ResolveResult(app=app, skipped="no update source configured")
+
+    if manager == "GithubUpdater":
+        return resolve_github(app)
+    if manager == "StaticFileUpdater":
+        return resolve_static(app)
+    if manager == "CodebergUpdater":
+        return resolve_codeberg(app)
+    if manager == "ForgejoUpdater":
+        return resolve_forgejo(app)
+    if manager == "GitlabUpdater":
+        return resolve_gitlab(app)
+    if manager == "FTPUpdater":
+        return ResolveResult(
+            app=app,
+            skipped="FTPUpdater not supported by gearlever-turbo (use GearLever UI)",
+        )
+    return ResolveResult(app=app, skipped=f"unknown update manager: {manager}")
+
+
+def resolve_all(apps: list[ManagedApp], jobs: int) -> list[ResolveResult]:
+    results: list[ResolveResult] = []
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        futures = {pool.submit(resolve_app, app): app for app in apps}
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception as exc:  # noqa: BLE001 — surface unexpected resolver bugs
+                app = futures[fut]
+                results.append(ResolveResult(app=app, error=f"resolver crash: {exc}"))
+    # Stable order matching discovery
+    order = {id(a): i for i, a in enumerate(apps)}
+    results.sort(key=lambda r: order.get(id(r.app), 0))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# zsync / appimageupdatetool
+# ---------------------------------------------------------------------------
+
+
+def zsync_update_available(file_path: Path) -> tuple[Optional[bool], str]:
+    """Return (True/False/None, detail). None means check failed."""
+    tool = shutil.which("appimageupdatetool")
+    if not tool:
+        return None, "appimageupdatetool not found"
+    try:
+        proc = subprocess.run(
+            [tool, "--check-for-update", str(file_path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    # Convention: 0 = update available, 1 = up to date
+    if proc.returncode == 0:
+        return True, (proc.stdout or proc.stderr or "update available").strip()
+    if proc.returncode == 1:
+        return False, (proc.stdout or proc.stderr or "up to date").strip()
+    return None, (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+
+
+def apply_zsync_update(file_path: Path) -> None:
+    tool = shutil.which("appimageupdatetool")
+    if not tool:
+        raise RuntimeError("appimageupdatetool is required for zsync updates but was not found")
+    proc = subprocess.run(
+        [tool, "--overwrite", str(file_path)],
+        capture_output=True,
+        text=True,
+        timeout=3600,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"appimageupdatetool failed for {file_path}: "
+            f"{(proc.stderr or proc.stdout or '').strip()}"
+        )
+    # Ensure executable bit (GearLever expects this)
+    file_path.chmod(file_path.stat().st_mode | 0o111)
+
+
+# ---------------------------------------------------------------------------
+# aria2 downloads + atomic replace
+# ---------------------------------------------------------------------------
+
+
+def require_aria2c() -> str:
+    path = shutil.which("aria2c")
+    if not path:
+        raise FileNotFoundError(
+            "aria2c not found on PATH. Install aria2 (e.g. `sudo apt install aria2`)."
+        )
+    return path
+
+
+def write_aria2_input(updates: list[PendingUpdate], staging_dir: Path) -> Path:
+    """Write aria2 input file. Each download lands as <hash>.partial in staging_dir."""
+    input_path = staging_dir / ARIA2_INPUT_NAME
+    lines: list[str] = []
+    for upd in updates:
+        assert upd.download_url
+        out_name = f"{upd.app.app_hash}.appimage"
+        lines.append(upd.download_url)
+        lines.append(f"  dir={staging_dir}")
+        lines.append(f"  out={out_name}")
+        lines.append("")
+    input_path.write_text("\n".join(lines), encoding="utf-8")
+    return input_path
+
+
+def run_aria2(
+    updates: list[PendingUpdate],
+    *,
+    jobs: int,
+    connections: int,
+    staging_dir: Path,
+) -> None:
+    aria2c = require_aria2c()
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    input_path = write_aria2_input(updates, staging_dir)
+    cmd = [
+        aria2c,
+        f"--input-file={input_path}",
+        f"--max-concurrent-downloads={jobs}",
+        f"--max-connection-per-server={connections}",
+        f"--split={connections}",
+        "--min-split-size=1M",
+        "--continue=true",
+        "--auto-file-renaming=false",
+        "--allow-overwrite=true",
+        f"--user-agent={USER_AGENT}",
+        "--console-log-level=notice" if not _quiet else "--console-log-level=warn",
+        "--summary-interval=0" if _quiet else "--summary-interval=5",
+    ]
+    log(f"Downloading {len(updates)} file(s) with aria2c "
+        f"(jobs={jobs}, connections/server={connections})…")
+    proc = subprocess.run(cmd, check=False)
+    if proc.returncode not in (0,):
+        # aria2 exit 0 = all success; non-zero may still have partial successes
+        raise RuntimeError(f"aria2c exited with code {proc.returncode}")
+
+
+def atomic_replace(src: Path, dest: Path) -> None:
+    """Replace dest with src atomically (same filesystem). Keep dest mode+x."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Stage beside destination so os.replace is atomic on the same volume
+    partial = dest.with_name(dest.name + PARTIAL_SUFFIX)
+    if partial.exists():
+        partial.unlink()
+    shutil.move(str(src), str(partial))
+    partial.chmod(partial.stat().st_mode | 0o111)
+    os.replace(partial, dest)
+
+
+def finalize_aria2_downloads(updates: list[PendingUpdate], staging_dir: Path) -> list[str]:
+    """Move staged downloads onto GearLever paths. Returns error messages."""
+    errors: list[str] = []
+    for upd in updates:
+        staged = staging_dir / f"{upd.app.app_hash}.appimage"
+        if not staged.is_file():
+            errors.append(f"{upd.app.name}: download missing ({staged.name})")
+            continue
+        # Basic AppImage sanity: non-trivial size
+        if staged.stat().st_size < 1024:
+            errors.append(f"{upd.app.name}: downloaded file too small")
+            staged.unlink(missing_ok=True)
+            continue
+        try:
+            atomic_replace(staged, upd.app.file_path)
+            log(f"  Updated {upd.app.name} → {upd.app.file_path}")
+        except OSError as exc:
+            errors.append(f"{upd.app.name}: failed to install: {exc}")
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def format_size(num: Optional[int]) -> str:
+    if not num:
+        return "?"
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if num < 1024 or unit == "GiB":
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} GiB"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="gearlever-turbo",
+        description=(
+            "Parallel update accelerator for GearLever AppImages. "
+            "Reads GearLever metadata, resolves updates concurrently, "
+            "and downloads with aria2c (or appimageupdatetool for zsync)."
+        ),
+    )
+    p.add_argument("--dry-run", action="store_true", help="Show pending updates without downloading")
+    p.add_argument("--quiet", "-q", action="store_true", help="Quiet mode (errors still printed)")
+    p.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=4,
+        help="Parallel resolve workers / concurrent aria2 downloads (default: 4)",
+    )
+    p.add_argument(
+        "--connections",
+        "-x",
+        type=int,
+        default=16,
+        help="aria2 connections per server (default: 16)",
+    )
+    p.add_argument(
+        "--config-dir",
+        type=Path,
+        help="Override GearLever config directory (contains gearlever.conf)",
+    )
+    p.add_argument("--version", action="version", version=f"gearlever-turbo {VERSION}")
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    global _quiet
+    args = build_parser().parse_args(argv)
+    _quiet = bool(args.quiet)
+
+    if args.jobs < 1 or args.connections < 1:
+        log_err("--jobs and --connections must be >= 1")
+        return EXIT_SETUP
+
+    # Locate GearLever data
+    if args.config_dir:
+        config_dirs = [args.config_dir.expanduser()]
+        if not (config_dirs[0] / "gearlever.conf").is_file() and not (
+            config_dirs[0] / "apps.json"
+        ).is_file():
+            log_err(f"No gearlever.conf or apps.json in {config_dirs[0]}")
+            return EXIT_SETUP
+    else:
+        config_dirs = find_gearlever_config_dirs()
+        if not config_dirs:
+            log_err(
+                "GearLever data not found.\n"
+                "Expected gearlever.conf under:\n"
+                f"  ~/.var/app/{FLATPAK_APP_ID}/config/\n"
+                "  ~/.config/\n"
+                "Install/open GearLever once, or pass --config-dir."
+            )
+            return EXIT_SETUP
+
+    config_dir = config_dirs[0]
+    log(f"Using GearLever config: {config_dir}")
+
+    try:
+        apps = parse_gearlever_apps(config_dir)
+    except Exception as exc:  # noqa: BLE001
+        log_err(f"Failed to parse GearLever metadata: {exc}")
+        return EXIT_SETUP
+
+    if not apps:
+        log("No managed AppImages found in GearLever config.")
+        return EXIT_OK
+
+    log(f"Found {len(apps)} managed AppImage(s). Resolving updates…")
+
+    results = resolve_all(apps, jobs=args.jobs)
+
+    pending: list[PendingUpdate] = []
+    errors = 0
+    up_to_date = 0
+    no_source = 0
+
+    for res in results:
+        label = res.app.name
+        if res.error:
+            errors += 1
+            log_err(f"  ERROR  {label}: {res.error}")
+            continue
+        if res.skipped:
+            if res.skipped.startswith("up to date"):
+                up_to_date += 1
+                log(f"  OK     {label}: {res.skipped}")
+            else:
+                no_source += 1
+                log(f"  SKIP   {label}: {res.skipped}")
+            continue
+        if res.update:
+            pending.append(res.update)
+            size = format_size(res.update.remote_size)
+            log(f"  UPDATE {label}: {res.update.detail} [{res.update.method}, {size}]")
+
+    log()
+    log(
+        f"Summary: {len(pending)} to update, {up_to_date} up to date, "
+        f"{no_source} skipped, {errors} errors"
+    )
+
+    if not pending:
+        return EXIT_PARTIAL if errors else EXIT_OK
+
+    if args.dry_run:
+        log("Dry run — no downloads performed.")
+        return EXIT_PARTIAL if errors else EXIT_OK
+
+    # Split zsync vs aria2
+    zsync_updates = [u for u in pending if u.method == "zsync"]
+    aria_updates = [u for u in pending if u.method == "aria2"]
+
+    apply_errors: list[str] = []
+
+    for upd in zsync_updates:
+        log(f"Delta-updating {upd.app.name} with appimageupdatetool…")
+        try:
+            apply_zsync_update(upd.app.file_path)
+            log(f"  Updated {upd.app.name} (zsync)")
+        except RuntimeError as exc:
+            apply_errors.append(str(exc))
+            log_err(f"  ERROR  {exc}")
+
+    if aria_updates:
+        try:
+            require_aria2c()
+        except FileNotFoundError as exc:
+            log_err(str(exc))
+            return EXIT_SETUP
+
+        staging = Path(tempfile.mkdtemp(prefix="gearlever-turbo-"))
+        try:
+            try:
+                run_aria2(
+                    aria_updates,
+                    jobs=args.jobs,
+                    connections=args.connections,
+                    staging_dir=staging,
+                )
+            except RuntimeError as exc:
+                log_err(str(exc))
+                # Still try to finalize any completed files
+            apply_errors.extend(finalize_aria2_downloads(aria_updates, staging))
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    for msg in apply_errors:
+        log_err(f"  ERROR  {msg}")
+
+    if apply_errors or errors:
+        return EXIT_PARTIAL
+
+    log("All updates applied.")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
