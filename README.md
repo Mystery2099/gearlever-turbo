@@ -13,7 +13,7 @@ Parallel update accelerator companion for [GearLever](https://github.com/mijorus
 sudo apt install aria2 binutils git python3
 
 # 2. Install to ~/.local/bin
-git clone https://github.com/mystery/gearlever-turbo.git
+git clone https://github.com/Mystery2099/gearlever-turbo.git
 cd gearlever-turbo
 ./install.sh
 
@@ -24,8 +24,11 @@ export PATH="$HOME/.local/bin:$PATH"
 gearlever-turbo --check
 # Or: ~/.local/bin/gearlever-turbo --check
 
-# 4. Update (prompts for confirmation on a terminal)
+# 4. Update AppImages (prompts for confirmation on a terminal)
 gearlever-turbo
+
+# Later: update gearlever-turbo itself
+gearlever-turbo --self-update
 ```
 
 On an interactive terminal, the default run shows a compact update list and plan, then asks before downloading. OK/SKIP rows are collapsed into counts (use `-v` to expand). Aria2 progress is shown without redirect spam. Use `--yes` to skip the prompt, `--quiet` for cron/systemd, or `--topgrade` for a one-line Topgrade-friendly summary.
@@ -58,7 +61,7 @@ sudo apt install aria2 binutils
 ## Install
 
 ```bash
-git clone https://github.com/mystery/gearlever-turbo.git
+git clone https://github.com/Mystery2099/gearlever-turbo.git
 cd gearlever-turbo
 ./install.sh
 # installs to ~/.local/bin/gearlever-turbo (no sudo)
@@ -72,6 +75,19 @@ mkdir -p ~/.local/bin
 cp gearlever-turbo ~/.local/bin/
 ```
 
+### Updating gearlever-turbo
+
+```bash
+# Recommended: update the installed binary from GitHub
+gearlever-turbo --self-update
+
+# If you keep a git clone:
+cd gearlever-turbo
+./update.sh   # git pull --ff-only + reinstall to ~/.local/bin
+```
+
+You can also add `gearlever-turbo --self-update` as a separate Topgrade custom command if you want Topgrade to refresh the tool itself.
+
 ## Usage
 
 ```bash
@@ -80,6 +96,7 @@ gearlever-turbo -v           # Show every OK / SKIP row
 gearlever-turbo --check      # Show what would update (alias: --dry-run)
 gearlever-turbo --yes        # Update without confirmation prompt
 gearlever-turbo --topgrade   # Quiet + one summary line (Topgrade / automation)
+gearlever-turbo --self-update # Update this script from GitHub
 gearlever-turbo --quiet      # Quiet mode for cron / systemd timers
 gearlever-turbo --jobs 8 --connections 16
 gearlever-turbo --help
@@ -92,6 +109,7 @@ gearlever-turbo --help
 | `--verbose` / `-v` | Show every OK / SKIP row and extra plan detail |
 | `--quiet` / `-q` | Suppress progress; errors still go to stderr (also skips confirm) |
 | `--topgrade` | Implies `--quiet` + `--yes`; prints one summary line to stdout |
+| `--self-update` | Fetch latest script from GitHub `master` and replace this binary |
 | `--jobs` / `-j` | Parallel resolve workers and concurrent aria2 downloads (default: 4) |
 | `--connections` / `-x` | aria2 connections per server (default: 16) |
 | `--config-dir DIR` | Override GearLever config directory |

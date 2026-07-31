@@ -30,10 +30,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-VERSION = "1.0.0"
-USER_AGENT = f"gearlever-turbo/{VERSION} (+https://github.com/mystery/gearlever-turbo; GearLever companion)"
+VERSION = "1.1.0"
+GITHUB_REPO = "Mystery2099/gearlever-turbo"
+GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
+SELF_UPDATE_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_REPO}/master/gearlever-turbo"
+)
+USER_AGENT = f"gearlever-turbo/{VERSION} (+{GITHUB_URL}; GearLever companion)"
 FLATPAK_APP_ID = "it.mijorus.gearlever"
 PARTIAL_SUFFIX = ".turbo-partial"
+SELF_UPDATE_SUFFIX = ".turbo-self-update"
 ARIA2_INPUT_NAME = "gearlever-turbo-aria2.txt"
 
 EXIT_OK = 0
@@ -46,6 +52,9 @@ RE_GH_EMBEDDED = re.compile(r"gh-releases-zsync\|.*\.zsync")
 RE_STATIC_EMBEDDED = re.compile(r"\szsync\|http\S*")
 RE_SHA1 = re.compile(r"SHA-1:\s*([0-9a-f]{40})", re.I)
 RE_ZSYNC_URL = re.compile(r"URL:\s*(.*)")
+RE_SCRIPT_VERSION = re.compile(
+    r'^VERSION\s*=\s*["\']([^"\']+)["\']', re.MULTILINE
+)
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -277,9 +286,79 @@ def http_headers(url: str) -> dict[str, str]:
         _, headers, _ = http_request(url, method="HEAD")
         return headers
     except RuntimeError:
-        # Some hosts reject HEAD; fall back to a ranged/stream-style GET and close.
+        # Some hosts reject HEAD; fall back to GET for headers.
         _, headers, _ = http_request(url, method="GET")
         return headers
+
+
+def parse_script_version(text: str) -> Optional[str]:
+    match = RE_SCRIPT_VERSION.search(text)
+    return match.group(1) if match else None
+
+
+def self_update(*, quiet: bool = False) -> int:
+    """Fetch the latest gearlever-turbo from GitHub and replace this script."""
+    target = Path(sys.argv[0]).resolve()
+    if not target.is_file():
+        log_err(f"Cannot self-update: script path is not a file ({target})")
+        return EXIT_SETUP
+    if not os.access(target, os.W_OK) or not os.access(target.parent, os.W_OK):
+        log_err(
+            f"Cannot self-update: no write permission for {target}\n"
+            f"Reinstall to a user-writable location (e.g. ~/.local/bin) or run as the owner."
+        )
+        return EXIT_SETUP
+
+    try:
+        local_bytes = target.read_bytes()
+    except OSError as exc:
+        log_err(f"Cannot read current script: {exc}")
+        return EXIT_SETUP
+
+    if not quiet:
+        log(f"Fetching {SELF_UPDATE_URL} …")
+    try:
+        _, _, remote_bytes = http_request(SELF_UPDATE_URL, timeout=60.0)
+    except RuntimeError as exc:
+        log_err(f"Self-update failed: {exc}")
+        return EXIT_SETUP
+
+    if not remote_bytes.startswith(b"#!/usr/bin/env python3") or b"gearlever-turbo" not in remote_bytes:
+        log_err("Self-update failed: downloaded file does not look like gearlever-turbo")
+        return EXIT_SETUP
+
+    local_hash = hashlib.sha256(local_bytes).hexdigest()
+    remote_hash = hashlib.sha256(remote_bytes).hexdigest()
+    local_ver = parse_script_version(local_bytes.decode("utf-8", errors="replace")) or VERSION
+    remote_ver = parse_script_version(remote_bytes.decode("utf-8", errors="replace"))
+
+    if local_hash == remote_hash:
+        msg = f"Already up to date (gearlever-turbo {local_ver})."
+        if quiet:
+            print(msg, flush=True)
+        else:
+            log(msg)
+        return EXIT_OK
+
+    partial = target.with_name(target.name + SELF_UPDATE_SUFFIX)
+    try:
+        partial.write_bytes(remote_bytes)
+        partial.chmod(partial.stat().st_mode | 0o111)
+        os.replace(partial, target)
+    except OSError as exc:
+        partial.unlink(missing_ok=True)
+        log_err(f"Self-update failed while replacing {target}: {exc}")
+        return EXIT_SETUP
+
+    if remote_ver:
+        msg = f"Updated gearlever-turbo {local_ver} → {remote_ver}"
+    else:
+        msg = f"Updated gearlever-turbo at {target}"
+    if quiet:
+        print(msg, flush=True)
+    else:
+        log(msg)
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -1263,6 +1342,7 @@ def build_parser() -> argparse.ArgumentParser:
   gearlever-turbo -v               # Show every OK / SKIP row
   gearlever-turbo --yes            # Download without prompting
   gearlever-turbo --topgrade       # Quiet one-line summary (Topgrade / cron)
+  gearlever-turbo --self-update    # Update this script from GitHub
   gearlever-turbo --quiet          # Silent (errors still printed)
 
 Environment:
@@ -1304,6 +1384,11 @@ Environment:
         help="Quiet + yes; print one summary line (for Topgrade / automation)",
     )
     p.add_argument(
+        "--self-update",
+        action="store_true",
+        help="Update this script from GitHub (master) and exit",
+    )
+    p.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -1340,6 +1425,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     _quiet = bool(args.quiet) or _topgrade
     yes = bool(args.yes) or _topgrade
     _enable_color(quiet=_quiet)
+
+    if args.self_update:
+        return self_update(quiet=_quiet)
 
     if args.jobs < 1 or args.connections < 1:
         log_err("--jobs and --connections must be >= 1")
