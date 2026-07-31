@@ -15,7 +15,8 @@ sudo apt install aria2 binutils git python3
 # 2. Install to ~/.local/bin
 git clone https://github.com/Mystery2099/gearlever-turbo.git
 cd gearlever-turbo
-./install.sh
+./setup.sh install
+# (alias: ./install.sh)
 
 # Ensure ~/.local/bin is on PATH (current shell + shell config if needed)
 export PATH="$HOME/.local/bin:$PATH"
@@ -63,8 +64,9 @@ sudo apt install aria2 binutils
 ```bash
 git clone https://github.com/Mystery2099/gearlever-turbo.git
 cd gearlever-turbo
-./install.sh
+./setup.sh install
 # installs to ~/.local/bin/gearlever-turbo (no sudo)
+# alias: ./install.sh
 ```
 
 Or manually:
@@ -75,6 +77,17 @@ mkdir -p ~/.local/bin
 cp gearlever-turbo ~/.local/bin/
 ```
 
+Clone helpers live in one script:
+
+```bash
+./setup.sh install     # copy to ~/.local/bin
+./setup.sh update      # git pull --ff-only + reinstall
+./setup.sh uninstall   # remove ~/.local/bin/gearlever-turbo
+./setup.sh             # usage
+```
+
+`./install.sh`, `./update.sh`, and `./uninstall.sh` are thin wrappers around those commands.
+
 ### Updating gearlever-turbo
 
 ```bash
@@ -83,7 +96,8 @@ gearlever-turbo --self-update
 
 # If you keep a git clone:
 cd gearlever-turbo
-./update.sh   # git pull --ff-only + reinstall to ~/.local/bin
+./setup.sh update   # git pull --ff-only + reinstall to ~/.local/bin
+# alias: ./update.sh
 ```
 
 You can also add `gearlever-turbo --self-update` as a separate Topgrade custom command if you want Topgrade to refresh the tool itself.
@@ -97,7 +111,8 @@ gearlever-turbo --self-uninstall
 gearlever-turbo --self-uninstall --yes
 
 # Or from a clone:
-./uninstall.sh
+./setup.sh uninstall
+# alias: ./uninstall.sh
 ```
 
 This only removes `~/.local/bin/gearlever-turbo`. It does **not** remove GearLever, AppImages, or a git clone of this repo.
