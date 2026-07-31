@@ -9,16 +9,20 @@ Parallel update accelerator companion for [GearLever](https://github.com/mijorus
 ## Quick start
 
 ```bash
-# 1. Dependencies (Debian/Ubuntu)
-sudo apt install aria2 binutils
+# 1. Dependencies (Debian/Ubuntu; needs Git + Python 3.10+ as python3)
+sudo apt install aria2 binutils git python3
 
 # 2. Install to ~/.local/bin
 git clone https://github.com/mystery/gearlever-turbo.git
 cd gearlever-turbo
 ./install.sh
 
+# Ensure ~/.local/bin is on PATH (current shell + shell config if needed)
+export PATH="$HOME/.local/bin:$PATH"
+
 # 3. Check for updates (no downloads)
 gearlever-turbo --check
+# Or: ~/.local/bin/gearlever-turbo --check
 
 # 4. Update (prompts for confirmation on a terminal)
 gearlever-turbo

@@ -16,6 +16,10 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "error: python3 is required but was not found on PATH." >&2
   exit 1
 fi
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)'; then
+  echo "error: Python 3.10+ is required (found $(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])'))." >&2
+  exit 1
+fi
 
 mkdir -p "$DEST_DIR"
 install -m 755 "$SRC" "$DEST"

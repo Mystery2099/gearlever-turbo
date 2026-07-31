@@ -1372,7 +1372,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             resolve_errors=resolve_error_msgs,
             missing_aria2=False,
         )
-        if tip and errors:
+        if tip and (errors or no_source):
             log(tip)
         return EXIT_PARTIAL if errors else EXIT_OK
 
@@ -1416,6 +1416,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     )
                 except RuntimeError as exc:
                     log_err(str(exc))
+                    apply_errors.append(str(exc))
                     # Still try to finalize any completed files
                 new_errs = finalize_aria2_downloads(aria_updates, staging)
                 apply_errors.extend(new_errs)
