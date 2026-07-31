@@ -6,6 +6,26 @@ Parallel update accelerator companion for [GearLever](https://github.com/mijorus
 
 > **Note:** This project was written by AI.
 
+## Quick start
+
+```bash
+# 1. Dependencies (Debian/Ubuntu)
+sudo apt install aria2 binutils
+
+# 2. Install to ~/.local/bin
+git clone https://github.com/mystery/gearlever-turbo.git
+cd gearlever-turbo
+./install.sh
+
+# 3. Check for updates (no downloads)
+gearlever-turbo --check
+
+# 4. Update (prompts for confirmation on a terminal)
+gearlever-turbo
+```
+
+On an interactive terminal, the default run shows a download plan (with total size) and asks before downloading. Use `--yes` to skip the prompt, or `--quiet` for cron/systemd.
+
 ## What it does
 
 1. **Reads GearLever metadata** — Parses `gearlever.conf` and legacy `apps.json` (including custom update URLs set in the GearLever UI). Zero separate configuration.
@@ -36,16 +56,24 @@ sudo apt install aria2 binutils
 ```bash
 git clone https://github.com/mystery/gearlever-turbo.git
 cd gearlever-turbo
+./install.sh
+# installs to ~/.local/bin/gearlever-turbo (no sudo)
+```
+
+Or manually:
+
+```bash
 chmod +x gearlever-turbo
-sudo ln -s "$(pwd)/gearlever-turbo" /usr/local/bin/gearlever-turbo
-# or keep it somewhere on your PATH / call it by path
+mkdir -p ~/.local/bin
+cp gearlever-turbo ~/.local/bin/
 ```
 
 ## Usage
 
 ```bash
-gearlever-turbo              # Check and update everything
-gearlever-turbo --dry-run    # Show what would be updated
+gearlever-turbo              # Check, confirm, then update
+gearlever-turbo --check      # Show what would update (alias: --dry-run)
+gearlever-turbo --yes        # Update without confirmation prompt
 gearlever-turbo --quiet      # Quiet mode for cron / systemd timers
 gearlever-turbo --jobs 8 --connections 16
 gearlever-turbo --help
@@ -53,17 +81,22 @@ gearlever-turbo --help
 
 | Flag | Description |
 |---|---|
-| `--dry-run` | Resolve and list updates; download nothing |
-| `--quiet` / `-q` | Suppress progress; errors still go to stderr |
+| `--check` / `--dry-run` | Resolve and list updates; download nothing |
+| `--yes` / `-y` | Download without asking for confirmation |
+| `--quiet` / `-q` | Suppress progress; errors still go to stderr (also skips confirm) |
 | `--jobs` / `-j` | Parallel resolve workers and concurrent aria2 downloads (default: 4) |
 | `--connections` / `-x` | aria2 connections per server (default: 16) |
 | `--config-dir DIR` | Override GearLever config directory |
+
+**Confirmation:** On a TTY, interactive runs prompt `Download N update(s) (~size)? [Y/n]` after showing the plan. Non-TTY, `--yes`, and `--quiet` skip the prompt and proceed.
+
+**Colors:** Status labels use ANSI colors on a TTY. Set `NO_COLOR=1` to disable.
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Success (including “nothing to do”) |
+| `0` | Success (including “nothing to do” or user aborted confirm) |
 | `1` | Partial failure (some apps failed to resolve or install) |
 | `2` | Setup problem (missing GearLever data, missing `aria2c`, bad flags) |
 
@@ -73,7 +106,7 @@ gearlever-turbo --help
 
 ```cron
 # Every day at 04:30
-30 4 * * * /usr/local/bin/gearlever-turbo --quiet
+30 4 * * * /home/YOU/.local/bin/gearlever-turbo --quiet
 ```
 
 **systemd user timer** — `~/.config/systemd/user/gearlever-turbo.service`:
@@ -84,7 +117,7 @@ Description=Parallel GearLever AppImage updates
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/gearlever-turbo --quiet
+ExecStart=%h/.local/bin/gearlever-turbo --quiet
 ```
 
 `~/.config/systemd/user/gearlever-turbo.timer`:
@@ -135,7 +168,7 @@ Mirrors GearLever’s updaters as closely as practical:
 | Codeberg / Forgejo | Latest matching asset size vs local size |
 | GitLab | HEAD `Content-Length` of the release link vs local size |
 
-Apps with no configured manager and no embedded `.upd_info` are skipped.
+Apps with no configured manager and no embedded `.upd_info` are skipped (with a hint to set an Update URL in GearLever).
 
 ## How downloads are staged
 
@@ -165,7 +198,7 @@ gearlever-turbo
 - GearLever stays in charge — only read its data, never fight it
 - Single-file, dependency-light — Python 3 stdlib + `aria2c`; optionally `appimageupdatetool`
 - Graceful degradation — metadata parsing lives in `parse_gearlever_apps()` so format changes need one place updated
-- Scriptable — `--quiet` and meaningful exit codes for cron/systemd
+- Scriptable — `--quiet` / `--yes` and meaningful exit codes for cron/systemd
 
 ## Assumptions & limitations
 

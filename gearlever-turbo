@@ -52,6 +52,30 @@ RE_ZSYNC_URL = re.compile(r"URL:\s*(.*)")
 # ---------------------------------------------------------------------------
 
 _quiet = False
+_use_color = False
+
+# ANSI (only when _use_color)
+_C_RESET = "\033[0m"
+_C_GREEN = "\033[32m"
+_C_CYAN = "\033[36m"
+_C_RED = "\033[31m"
+_C_YELLOW = "\033[33m"
+_C_DIM = "\033[2m"
+
+
+def _enable_color(*, quiet: bool) -> None:
+    """Enable ANSI colors on a TTY unless quiet or NO_COLOR is set."""
+    global _use_color
+    if quiet or os.environ.get("NO_COLOR"):
+        _use_color = False
+        return
+    _use_color = sys.stdout.isatty()
+
+
+def _paint(text: str, color: str) -> str:
+    if not _use_color:
+        return text
+    return f"{color}{text}{_C_RESET}"
 
 
 def log(msg: str = "") -> None:
@@ -61,6 +85,75 @@ def log(msg: str = "") -> None:
 
 def log_err(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def status_tag(kind: str) -> str:
+    """Colored status label for resolve output."""
+    labels = {
+        "OK": ("OK    ", _C_GREEN),
+        "UPDATE": ("UPDATE", _C_CYAN),
+        "SKIP": ("SKIP  ", _C_YELLOW),
+        "ERROR": ("ERROR ", _C_RED),
+    }
+    text, color = labels.get(kind, (kind, ""))
+    return _paint(f"  {text}", color) if color else f"  {text}"
+
+
+# ---------------------------------------------------------------------------
+# Dependency / install hints
+# ---------------------------------------------------------------------------
+
+
+def aria2_install_hint() -> str:
+    """Best-effort distro package hint for aria2."""
+    if shutil.which("apt-get") or shutil.which("apt"):
+        return "sudo apt install aria2"
+    if shutil.which("dnf"):
+        return "sudo dnf install aria2"
+    if shutil.which("pacman"):
+        return "sudo pacman -S aria2"
+    if shutil.which("zypper"):
+        return "sudo zypper install aria2"
+    if shutil.which("apk"):
+        return "sudo apk add aria2"
+    return "install the aria2 package for your distribution"
+
+
+def appimageupdatetool_hint() -> str:
+    return (
+        "install appimageupdatetool (AppImageUpdate) for faster delta updates; "
+        "without it, full downloads are used when possible"
+    )
+
+
+def run_preflight(apps: list[ManagedApp]) -> tuple[bool, bool]:
+    """Print dependency status. Returns (has_aria2, has_zsync_tool)."""
+    has_aria2 = shutil.which("aria2c") is not None
+    has_zsync = shutil.which("appimageupdatetool") is not None
+
+    if has_aria2:
+        log(f"  {_paint('OK', _C_GREEN)}     aria2c found")
+    else:
+        log(
+            f"  {_paint('WARN', _C_YELLOW)}   aria2c not found — "
+            f"needed for full downloads ({aria2_install_hint()})"
+        )
+
+    zsync_capable = any(
+        a.embedded_upd_info and "zsync" in a.embedded_upd_info.lower() for a in apps
+    )
+
+    if has_zsync:
+        log(f"  {_paint('OK', _C_GREEN)}     appimageupdatetool found")
+    elif zsync_capable:
+        log(
+            f"  {_paint('WARN', _C_YELLOW)}   appimageupdatetool not found — "
+            f"{appimageupdatetool_hint()}"
+        )
+    else:
+        log(f"  {_paint('OK', _C_DIM)}     appimageupdatetool optional (not needed yet)")
+
+    return has_aria2, has_zsync
 
 
 # ---------------------------------------------------------------------------
@@ -829,7 +922,13 @@ def resolve_app(app: ManagedApp) -> ResolveResult:
     # Embedded zsync without a configured manager still routes here via manager set in parse
     manager = app.manager
     if not manager:
-        return ResolveResult(app=app, skipped="no update source configured")
+        return ResolveResult(
+            app=app,
+            skipped=(
+                "no update source — set one in GearLever "
+                "(app menu → Update URL / provider)"
+            ),
+        )
 
     if manager == "GithubUpdater":
         return resolve_github(app)
@@ -851,6 +950,9 @@ def resolve_app(app: ManagedApp) -> ResolveResult:
 
 def resolve_all(apps: list[ManagedApp], jobs: int) -> list[ResolveResult]:
     results: list[ResolveResult] = []
+    total = len(apps)
+    done = 0
+    show_progress = (not _quiet) and sys.stdout.isatty()
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         futures = {pool.submit(resolve_app, app): app for app in apps}
         for fut in as_completed(futures):
@@ -859,6 +961,15 @@ def resolve_all(apps: list[ManagedApp], jobs: int) -> list[ResolveResult]:
             except Exception as exc:  # noqa: BLE001 — surface unexpected resolver bugs
                 app = futures[fut]
                 results.append(ResolveResult(app=app, error=f"resolver crash: {exc}"))
+            done += 1
+            if show_progress:
+                print(
+                    f"\rChecking {done}/{total}…",
+                    end="",
+                    flush=True,
+                )
+    if show_progress:
+        print("\r" + " " * 24 + "\r", end="", flush=True)
     # Stable order matching discovery
     order = {id(a): i for i, a in enumerate(apps)}
     results.sort(key=lambda r: order.get(id(r.app), 0))
@@ -922,7 +1033,7 @@ def require_aria2c() -> str:
     path = shutil.which("aria2c")
     if not path:
         raise FileNotFoundError(
-            "aria2c not found on PATH. Install aria2 (e.g. `sudo apt install aria2`)."
+            f"aria2c not found on PATH. Install it with: {aria2_install_hint()}"
         )
     return path
 
@@ -1015,14 +1126,95 @@ def finalize_aria2_downloads(updates: list[PendingUpdate], staging_dir: Path) ->
 def format_size(num: Optional[int]) -> str:
     if not num:
         return "?"
+    value = float(num)
     for unit in ("B", "KiB", "MiB", "GiB"):
-        if num < 1024 or unit == "GiB":
-            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
-        num /= 1024
-    return f"{num:.1f} GiB"
+        if value < 1024 or unit == "GiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GiB"
+
+
+def total_pending_size(pending: list[PendingUpdate]) -> Optional[int]:
+    sizes = [u.remote_size for u in pending if u.remote_size]
+    if not sizes:
+        return None
+    return sum(sizes)
+
+
+def print_download_plan(pending: list[PendingUpdate]) -> None:
+    log("Download plan:")
+    for upd in pending:
+        size = format_size(upd.remote_size)
+        method = "delta (zsync)" if upd.method == "zsync" else "full (aria2)"
+        log(f"  • {upd.app.name}: {method}, {size}")
+        if upd.detail:
+            log(f"      {_paint(upd.detail, _C_DIM)}")
+    total = total_pending_size(pending)
+    log(f"  Total: {format_size(total)} across {len(pending)} update(s)")
+    log()
+
+
+def confirm_download(pending: list[PendingUpdate], *, yes: bool) -> bool:
+    """Return True to proceed. Quiet/yes/non-TTY skip the prompt."""
+    if _quiet or yes or not sys.stdin.isatty():
+        return True
+    total = total_pending_size(pending)
+    size_hint = format_size(total)
+    prompt = f"Download {len(pending)} update(s) (~{size_hint})? [Y/n] "
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        return True
+    return answer in ("", "y", "yes")
+
+
+def failure_tip(
+    *,
+    errors: int,
+    no_source: int,
+    apply_errors: list[str],
+    resolve_errors: list[str],
+    missing_aria2: bool,
+) -> Optional[str]:
+    """One-line tip for the most likely fix after a partial failure."""
+    if missing_aria2:
+        return f"Tip: install aria2 — {aria2_install_hint()}"
+    joined = " ".join(resolve_errors + apply_errors).lower()
+    if "rate limit" in joined:
+        return "Tip: set GITHUB_TOKEN or GH_TOKEN and retry (GitHub API rate limits)."
+    if (
+        "http 403" in joined
+        and "github" in joined
+        and not (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"))
+    ):
+        return "Tip: set GITHUB_TOKEN or GH_TOKEN and retry (GitHub API rate limits)."
+    if "network error" in joined or "tunnel" in joined:
+        return "Tip: check your network connection and retry."
+    if no_source and errors == 0 and not apply_errors:
+        return "Tip: set an Update URL/provider in GearLever for skipped apps."
+    if no_source and errors:
+        return (
+            "Tip: set Update URLs in GearLever for skipped apps; "
+            "check network/token for errors."
+        )
+    if apply_errors:
+        return "Tip: re-run after fixing the errors above; partial downloads are cleaned up."
+    if errors:
+        return "Tip: check network connectivity, or set GITHUB_TOKEN if using GitHub sources."
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
+    epilog = """examples:
+  gearlever-turbo --check          # Resolve only (dry run)
+  gearlever-turbo                  # Check, confirm, then download
+  gearlever-turbo --yes            # Download without prompting
+  gearlever-turbo --quiet          # Silent (for cron / systemd)
+
+Environment:
+  GITHUB_TOKEN / GH_TOKEN   Raise GitHub API rate limits
+  NO_COLOR                  Disable ANSI colors
+"""
     p = argparse.ArgumentParser(
         prog="gearlever-turbo",
         description=(
@@ -1030,8 +1222,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Reads GearLever metadata, resolves updates concurrently, "
             "and downloads with aria2c (or appimageupdatetool for zsync)."
         ),
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--dry-run", action="store_true", help="Show pending updates without downloading")
+    p.add_argument(
+        "--dry-run",
+        "--check",
+        dest="dry_run",
+        action="store_true",
+        help="Show pending updates without downloading (--check is an alias)",
+    )
+    p.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Download without confirmation prompt",
+    )
     p.add_argument("--quiet", "-q", action="store_true", help="Quiet mode (errors still printed)")
     p.add_argument(
         "--jobs",
@@ -1060,6 +1266,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     global _quiet
     args = build_parser().parse_args(argv)
     _quiet = bool(args.quiet)
+    _enable_color(quiet=_quiet)
 
     if args.jobs < 1 or args.connections < 1:
         log_err("--jobs and --connections must be >= 1")
@@ -1098,7 +1305,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         log("No managed AppImages found in GearLever config.")
         return EXIT_OK
 
-    log(f"Found {len(apps)} managed AppImage(s). Resolving updates…")
+    log(f"Found {len(apps)} managed AppImage(s).")
+    log("Dependencies:")
+    has_aria2, _has_zsync = run_preflight(apps)
+    log()
+    log(f"Resolving updates for {len(apps)} app(s)…")
 
     results = resolve_all(apps, jobs=args.jobs)
 
@@ -1106,25 +1317,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     errors = 0
     up_to_date = 0
     no_source = 0
+    resolve_error_msgs: list[str] = []
 
     for res in results:
         label = res.app.name
         if res.error:
             errors += 1
-            log_err(f"  ERROR  {label}: {res.error}")
+            resolve_error_msgs.append(res.error)
+            log_err(f"{status_tag('ERROR')} {label}: {res.error}")
             continue
         if res.skipped:
             if res.skipped.startswith("up to date"):
                 up_to_date += 1
-                log(f"  OK     {label}: {res.skipped}")
+                log(f"{status_tag('OK')} {label}: {res.skipped}")
             else:
                 no_source += 1
-                log(f"  SKIP   {label}: {res.skipped}")
+                log(f"{status_tag('SKIP')} {label}: {res.skipped}")
             continue
         if res.update:
             pending.append(res.update)
             size = format_size(res.update.remote_size)
-            log(f"  UPDATE {label}: {res.update.detail} [{res.update.method}, {size}]")
+            log(
+                f"{status_tag('UPDATE')} {label}: {res.update.detail} "
+                f"[{res.update.method}, {size}]"
+            )
 
     log()
     log(
@@ -1133,57 +1349,105 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     if not pending:
+        tip = failure_tip(
+            errors=errors,
+            no_source=no_source,
+            apply_errors=[],
+            resolve_errors=resolve_error_msgs,
+            missing_aria2=False,
+        )
+        if tip and (errors or no_source):
+            log(tip)
         return EXIT_PARTIAL if errors else EXIT_OK
+
+    log()
+    print_download_plan(pending)
 
     if args.dry_run:
         log("Dry run — no downloads performed.")
+        tip = failure_tip(
+            errors=errors,
+            no_source=no_source,
+            apply_errors=[],
+            resolve_errors=resolve_error_msgs,
+            missing_aria2=False,
+        )
+        if tip and errors:
+            log(tip)
         return EXIT_PARTIAL if errors else EXIT_OK
+
+    if not confirm_download(pending, yes=bool(args.yes)):
+        log("Aborted — no downloads performed.")
+        return EXIT_OK
 
     # Split zsync vs aria2
     zsync_updates = [u for u in pending if u.method == "zsync"]
     aria_updates = [u for u in pending if u.method == "aria2"]
 
     apply_errors: list[str] = []
+    updated_names: list[str] = []
+    missing_aria2 = False
 
     for upd in zsync_updates:
         log(f"Delta-updating {upd.app.name} with appimageupdatetool…")
         try:
             apply_zsync_update(upd.app.file_path)
             log(f"  Updated {upd.app.name} (zsync)")
+            updated_names.append(upd.app.name)
         except RuntimeError as exc:
             apply_errors.append(str(exc))
-            log_err(f"  ERROR  {exc}")
+            log_err(f"{status_tag('ERROR')} {exc}")
 
     if aria_updates:
-        try:
-            require_aria2c()
-        except FileNotFoundError as exc:
-            log_err(str(exc))
-            return EXIT_SETUP
-
-        staging = Path(tempfile.mkdtemp(prefix="gearlever-turbo-"))
-        try:
+        if not has_aria2:
+            missing_aria2 = True
+            msg = f"aria2c not found on PATH. Install it with: {aria2_install_hint()}"
+            log_err(msg)
+            apply_errors.append(msg)
+        else:
+            staging = Path(tempfile.mkdtemp(prefix="gearlever-turbo-"))
             try:
-                run_aria2(
-                    aria_updates,
-                    jobs=args.jobs,
-                    connections=args.connections,
-                    staging_dir=staging,
-                )
-            except RuntimeError as exc:
-                log_err(str(exc))
-                # Still try to finalize any completed files
-            apply_errors.extend(finalize_aria2_downloads(aria_updates, staging))
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
-
-    for msg in apply_errors:
-        log_err(f"  ERROR  {msg}")
+                try:
+                    run_aria2(
+                        aria_updates,
+                        jobs=args.jobs,
+                        connections=args.connections,
+                        staging_dir=staging,
+                    )
+                except RuntimeError as exc:
+                    log_err(str(exc))
+                    # Still try to finalize any completed files
+                new_errs = finalize_aria2_downloads(aria_updates, staging)
+                apply_errors.extend(new_errs)
+                for msg in new_errs:
+                    log_err(f"{status_tag('ERROR')} {msg}")
+                failed_names = {
+                    e.split(":", 1)[0] for e in new_errs if ":" in e
+                }
+                for upd in aria_updates:
+                    if upd.app.name not in failed_names:
+                        updated_names.append(upd.app.name)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
 
     if apply_errors or errors:
-        return EXIT_PARTIAL
+        tip = failure_tip(
+            errors=errors,
+            no_source=no_source,
+            apply_errors=apply_errors,
+            resolve_errors=resolve_error_msgs,
+            missing_aria2=missing_aria2,
+        )
+        if tip:
+            log(tip)
+        if updated_names:
+            log(f"Partially updated: {', '.join(updated_names)}")
+        return EXIT_SETUP if missing_aria2 and not updated_names else EXIT_PARTIAL
 
-    log("All updates applied.")
+    if updated_names:
+        log(f"All updates applied: {', '.join(updated_names)}")
+    else:
+        log("All updates applied.")
     return EXIT_OK
 
 
