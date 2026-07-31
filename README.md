@@ -88,6 +88,20 @@ cd gearlever-turbo
 
 You can also add `gearlever-turbo --self-update` as a separate Topgrade custom command if you want Topgrade to refresh the tool itself.
 
+### Uninstalling gearlever-turbo
+
+```bash
+# Recommended: remove the installed binary
+gearlever-turbo --self-uninstall
+# skip the confirm prompt:
+gearlever-turbo --self-uninstall --yes
+
+# Or from a clone:
+./uninstall.sh
+```
+
+This only removes `~/.local/bin/gearlever-turbo`. It does **not** remove GearLever, AppImages, or a git clone of this repo.
+
 ## Usage
 
 ```bash
@@ -97,6 +111,7 @@ gearlever-turbo --check      # Show what would update (alias: --dry-run)
 gearlever-turbo --yes        # Update without confirmation prompt
 gearlever-turbo --topgrade   # Quiet + one summary line (Topgrade / automation)
 gearlever-turbo --self-update # Update this script from the latest GitHub release
+gearlever-turbo --self-uninstall # Remove ~/.local/bin/gearlever-turbo
 gearlever-turbo --quiet      # Quiet mode for cron / systemd timers
 gearlever-turbo --jobs 8 --connections 16
 gearlever-turbo --help
@@ -110,6 +125,7 @@ gearlever-turbo --help
 | `--quiet` / `-q` | Suppress progress; errors still go to stderr (also skips confirm) |
 | `--topgrade` | Implies `--quiet` + `--yes`; prints one summary line to stdout |
 | `--self-update` | Fetch latest *released* script from GitHub and replace this binary |
+| `--self-uninstall` | Remove `~/.local/bin/gearlever-turbo` (confirm on TTY unless `--yes`) |
 | `--jobs` / `-j` | Parallel resolve workers and concurrent aria2 downloads (default: 4) |
 | `--connections` / `-x` | aria2 connections per server (default: 16) |
 | `--config-dir DIR` | Override GearLever config directory |

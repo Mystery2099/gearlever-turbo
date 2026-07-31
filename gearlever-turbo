@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 GITHUB_REPO = "Mystery2099/gearlever-turbo"
 GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
 GITHUB_API_LATEST_RELEASE = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -383,6 +383,78 @@ def self_update(*, quiet: bool = False) -> int:
         print(msg, flush=True)
     else:
         log(msg)
+    return EXIT_OK
+
+
+def default_install_path() -> Path:
+    return Path.home() / ".local" / "bin" / "gearlever-turbo"
+
+
+def looks_like_source_checkout(path: Path) -> bool:
+    """True if path lives next to install.sh / .git (don't delete the clone by mistake)."""
+    try:
+        parent = path.resolve().parent
+    except OSError:
+        return False
+    return (parent / "install.sh").is_file() or (parent / ".git").exists()
+
+
+def confirm_uninstall(path: Path, *, yes: bool, quiet: bool) -> bool:
+    if yes or quiet or not sys.stdin.isatty():
+        return True
+    prompt = f"Remove installed gearlever-turbo at {path}? [y/N] "
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
+def self_uninstall(*, yes: bool = False, quiet: bool = False) -> int:
+    """Remove the user install at ~/.local/bin/gearlever-turbo (not a git clone)."""
+    install_path = default_install_path()
+    running = Path(sys.argv[0]).resolve()
+
+    target: Optional[Path] = None
+    if install_path.is_file():
+        target = install_path.resolve()
+    elif running.is_file() and not looks_like_source_checkout(running):
+        # Manual install somewhere else (not the repo checkout)
+        target = running
+    elif running.is_file() and looks_like_source_checkout(running):
+        log_err(
+            f"Refusing to delete the source checkout at {running}\n"
+            f"To remove the installed copy:  {install_path}  (missing)\n"
+            f"Or run: ./uninstall.sh   from the clone after install,\n"
+            f"or: gearlever-turbo --self-uninstall  using the ~/.local/bin copy."
+        )
+        return EXIT_SETUP
+    else:
+        log_err(f"No installed gearlever-turbo found at {install_path}")
+        return EXIT_SETUP
+
+    assert target is not None
+    if not os.access(target, os.W_OK) or not os.access(target.parent, os.W_OK):
+        log_err(f"Cannot uninstall: no write permission for {target}")
+        return EXIT_SETUP
+
+    if not confirm_uninstall(target, yes=yes, quiet=quiet):
+        if not quiet:
+            log("Aborted — nothing removed.")
+        return EXIT_OK
+
+    try:
+        target.unlink()
+    except OSError as exc:
+        log_err(f"Failed to remove {target}: {exc}")
+        return EXIT_SETUP
+
+    msg = f"Removed {target}"
+    if quiet:
+        print(msg, flush=True)
+    else:
+        log(msg)
+        log("GearLever AppImages were not touched.")
     return EXIT_OK
 
 
@@ -1368,6 +1440,7 @@ def build_parser() -> argparse.ArgumentParser:
   gearlever-turbo --yes            # Download without prompting
   gearlever-turbo --topgrade       # Quiet one-line summary (Topgrade / cron)
   gearlever-turbo --self-update    # Update this script from latest GitHub release
+  gearlever-turbo --self-uninstall # Remove ~/.local/bin/gearlever-turbo
   gearlever-turbo --quiet          # Silent (errors still printed)
 
 Environment:
@@ -1414,6 +1487,11 @@ Environment:
         help="Update this script from the latest GitHub release and exit",
     )
     p.add_argument(
+        "--self-uninstall",
+        action="store_true",
+        help="Remove the installed copy (~/.local/bin/gearlever-turbo) and exit",
+    )
+    p.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -1451,8 +1529,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     yes = bool(args.yes) or _topgrade
     _enable_color(quiet=_quiet)
 
+    if args.self_update and args.self_uninstall:
+        log_err("Use only one of --self-update or --self-uninstall")
+        return EXIT_SETUP
     if args.self_update:
         return self_update(quiet=_quiet)
+    if args.self_uninstall:
+        return self_uninstall(yes=yes, quiet=_quiet)
 
     if args.jobs < 1 or args.connections < 1:
         log_err("--jobs and --connections must be >= 1")
