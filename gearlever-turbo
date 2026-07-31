@@ -52,6 +52,8 @@ RE_ZSYNC_URL = re.compile(r"URL:\s*(.*)")
 # ---------------------------------------------------------------------------
 
 _quiet = False
+_verbose = False
+_topgrade = False
 _use_color = False
 
 # ANSI (only when _use_color)
@@ -61,6 +63,7 @@ _C_CYAN = "\033[36m"
 _C_RED = "\033[31m"
 _C_YELLOW = "\033[33m"
 _C_DIM = "\033[2m"
+_C_BOLD = "\033[1m"
 
 
 def _enable_color(*, quiet: bool) -> None:
@@ -87,13 +90,26 @@ def log_err(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def topgrade_line(msg: str) -> None:
+    """Always print to stdout (used for --topgrade one-line summaries)."""
+    print(msg, flush=True)
+
+
+def section_header(title: str, width: int = 52) -> None:
+    """Nala-like section rule. No-op when quiet."""
+    if _quiet:
+        return
+    bar = "─" * max(4, width - len(title) - 4)
+    log(_paint(f"── {title} {bar}", _C_BOLD if _use_color else ""))
+
+
 def status_tag(kind: str) -> str:
     """Colored status label for resolve output."""
     labels = {
-        "OK": ("OK    ", _C_GREEN),
-        "UPDATE": ("UPDATE", _C_CYAN),
-        "SKIP": ("SKIP  ", _C_YELLOW),
-        "ERROR": ("ERROR ", _C_RED),
+        "OK": ("OK      ", _C_GREEN),
+        "UPDATE": ("Updating", _C_CYAN),
+        "SKIP": ("SKIP    ", _C_YELLOW),
+        "ERROR": ("ERROR   ", _C_RED),
     }
     text, color = labels.get(kind, (kind, ""))
     return _paint(f"  {text}", color) if color else f"  {text}"
@@ -127,31 +143,38 @@ def appimageupdatetool_hint() -> str:
 
 
 def run_preflight(apps: list[ManagedApp]) -> tuple[bool, bool]:
-    """Print dependency status. Returns (has_aria2, has_zsync_tool)."""
+    """Print compact dependency status. Returns (has_aria2, has_zsync_tool)."""
     has_aria2 = shutil.which("aria2c") is not None
     has_zsync = shutil.which("appimageupdatetool") is not None
-
-    if has_aria2:
-        log(f"  {_paint('OK', _C_GREEN)}     aria2c found")
-    else:
-        log(
-            f"  {_paint('WARN', _C_YELLOW)}   aria2c not found — "
-            f"needed for full downloads ({aria2_install_hint()})"
-        )
-
     zsync_capable = any(
         a.embedded_upd_info and "zsync" in a.embedded_upd_info.lower() for a in apps
     )
+    has_problems = (not has_aria2) or (zsync_capable and not has_zsync)
 
-    if has_zsync:
-        log(f"  {_paint('OK', _C_GREEN)}     appimageupdatetool found")
-    elif zsync_capable:
-        log(
-            f"  {_paint('WARN', _C_YELLOW)}   appimageupdatetool not found — "
-            f"{appimageupdatetool_hint()}"
-        )
+    if _verbose or has_problems:
+        log("Dependencies:")
+        if has_aria2:
+            log(f"  {_paint('OK', _C_GREEN)}     aria2c found")
+        else:
+            log(
+                f"  {_paint('WARN', _C_YELLOW)}   aria2c not found — "
+                f"needed for full downloads ({aria2_install_hint()})"
+            )
+        if has_zsync:
+            log(f"  {_paint('OK', _C_GREEN)}     appimageupdatetool found")
+        elif zsync_capable:
+            log(
+                f"  {_paint('WARN', _C_YELLOW)}   appimageupdatetool not found — "
+                f"will fall back to full downloads"
+            )
+            log(f"           {_paint(appimageupdatetool_hint(), _C_DIM)}")
+        else:
+            log(f"  {_paint('OK', _C_DIM)}     appimageupdatetool optional (not needed yet)")
     else:
-        log(f"  {_paint('OK', _C_DIM)}     appimageupdatetool optional (not needed yet)")
+        bits: list[str] = [_paint("aria2c", _C_GREEN)]
+        if has_zsync:
+            bits.append(_paint("appimageupdatetool", _C_GREEN))
+        log("Deps: " + " · ".join(bits))
 
     return has_aria2, has_zsync
 
@@ -1063,6 +1086,8 @@ def run_aria2(
     aria2c = require_aria2c()
     staging_dir.mkdir(parents=True, exist_ok=True)
     input_path = write_aria2_input(updates, staging_dir)
+    # error: hide NOTICE redirect spam; interactive keeps compact progress readout
+    interactive = (not _quiet) and sys.stdout.isatty()
     cmd = [
         aria2c,
         f"--input-file={input_path}",
@@ -1074,11 +1099,15 @@ def run_aria2(
         "--auto-file-renaming=false",
         "--allow-overwrite=true",
         f"--user-agent={USER_AGENT}",
-        "--console-log-level=notice" if not _quiet else "--console-log-level=warn",
-        "--summary-interval=0" if _quiet else "--summary-interval=5",
+        "--console-log-level=error",
+        "--summary-interval=1" if interactive else "--summary-interval=0",
+        "--show-console-readout=true" if interactive else "--show-console-readout=false",
     ]
-    log(f"Downloading {len(updates)} file(s) with aria2c "
-        f"(jobs={jobs}, connections/server={connections})…")
+    section_header("Downloading")
+    log(
+        f"Fetching {len(updates)} file(s) with aria2c "
+        f"(jobs={jobs}, connections/server={connections})…"
+    )
     proc = subprocess.run(cmd, check=False)
     if proc.returncode not in (0,):
         # aria2 exit 0 = all success; non-zero may still have partial successes
@@ -1112,7 +1141,8 @@ def finalize_aria2_downloads(updates: list[PendingUpdate], staging_dir: Path) ->
             continue
         try:
             atomic_replace(staged, upd.app.file_path)
-            log(f"  Updated {upd.app.name} → {upd.app.file_path}")
+            if _verbose:
+                log(f"  Updated {upd.app.name} → {upd.app.file_path}")
         except OSError as exc:
             errors.append(f"{upd.app.name}: failed to install: {exc}")
     return errors
@@ -1142,15 +1172,17 @@ def total_pending_size(pending: list[PendingUpdate]) -> Optional[int]:
 
 
 def print_download_plan(pending: list[PendingUpdate]) -> None:
-    log("Download plan:")
+    section_header("Plan")
+    name_w = max((len(u.app.name) for u in pending), default=8)
+    name_w = min(max(name_w, 8), 40)
     for upd in pending:
         size = format_size(upd.remote_size)
-        method = "delta (zsync)" if upd.method == "zsync" else "full (aria2)"
-        log(f"  • {upd.app.name}: {method}, {size}")
-        if upd.detail:
-            log(f"      {_paint(upd.detail, _C_DIM)}")
+        method = "delta" if upd.method == "zsync" else "full download"
+        log(f"  {upd.app.name:<{name_w}}  {method:<14}  {size}")
+        if _verbose and upd.detail:
+            log(f"  {'':<{name_w}}  {_paint(upd.detail, _C_DIM)}")
     total = total_pending_size(pending)
-    log(f"  Total: {format_size(total)} across {len(pending)} update(s)")
+    log(f"  {'Total':<{name_w}}  {'':<14}  {format_size(total)}")
     log()
 
 
@@ -1160,12 +1192,32 @@ def confirm_download(pending: list[PendingUpdate], *, yes: bool) -> bool:
         return True
     total = total_pending_size(pending)
     size_hint = format_size(total)
-    prompt = f"Download {len(pending)} update(s) (~{size_hint})? [Y/n] "
+    prompt = (
+        f"Do you want to continue? {len(pending)} update(s), ~{size_hint} [Y/n] "
+    )
     try:
         answer = input(prompt).strip().lower()
     except EOFError:
         return True
     return answer in ("", "y", "yes")
+
+
+def format_topgrade_summary(
+    *,
+    updated: list[str],
+    failed: list[str],
+    nothing: bool,
+) -> str:
+    if nothing and not failed:
+        return "Nothing to update."
+    parts: list[str] = []
+    if updated:
+        parts.append(f"Updated: {', '.join(updated)}.")
+    if failed:
+        parts.append(f"Failed: {'; '.join(failed)}.")
+    if not parts:
+        return "Nothing to update."
+    return " ".join(parts)
 
 
 def failure_tip(
@@ -1208,8 +1260,10 @@ def build_parser() -> argparse.ArgumentParser:
     epilog = """examples:
   gearlever-turbo --check          # Resolve only (dry run)
   gearlever-turbo                  # Check, confirm, then download
+  gearlever-turbo -v               # Show every OK / SKIP row
   gearlever-turbo --yes            # Download without prompting
-  gearlever-turbo --quiet          # Silent (for cron / systemd)
+  gearlever-turbo --topgrade       # Quiet one-line summary (Topgrade / cron)
+  gearlever-turbo --quiet          # Silent (errors still printed)
 
 Environment:
   GITHUB_TOKEN / GH_TOKEN   Raise GitHub API rate limits
@@ -1238,7 +1292,23 @@ Environment:
         action="store_true",
         help="Download without confirmation prompt",
     )
-    p.add_argument("--quiet", "-q", action="store_true", help="Quiet mode (errors still printed)")
+    p.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Quiet mode (errors still printed)",
+    )
+    p.add_argument(
+        "--topgrade",
+        action="store_true",
+        help="Quiet + yes; print one summary line (for Topgrade / automation)",
+    )
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show every OK / SKIP row and extra detail",
+    )
     p.add_argument(
         "--jobs",
         "-j",
@@ -1263,9 +1333,12 @@ Environment:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    global _quiet
+    global _quiet, _verbose, _topgrade
     args = build_parser().parse_args(argv)
-    _quiet = bool(args.quiet)
+    _topgrade = bool(args.topgrade)
+    _verbose = bool(args.verbose) and not _topgrade
+    _quiet = bool(args.quiet) or _topgrade
+    yes = bool(args.yes) or _topgrade
     _enable_color(quiet=_quiet)
 
     if args.jobs < 1 or args.connections < 1:
@@ -1293,7 +1366,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return EXIT_SETUP
 
     config_dir = config_dirs[0]
-    log(f"Using GearLever config: {config_dir}")
+    if _verbose:
+        log(f"Using GearLever config: {config_dir}")
 
     try:
         apps = parse_gearlever_apps(config_dir)
@@ -1302,14 +1376,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         return EXIT_SETUP
 
     if not apps:
-        log("No managed AppImages found in GearLever config.")
+        if _topgrade:
+            topgrade_line("Nothing to update.")
+        else:
+            log("No managed AppImages found in GearLever config.")
         return EXIT_OK
 
-    log(f"Found {len(apps)} managed AppImage(s).")
-    log("Dependencies:")
     has_aria2, _has_zsync = run_preflight(apps)
-    log()
-    log(f"Resolving updates for {len(apps)} app(s)…")
+    section_header(f"Checking {len(apps)} AppImages")
 
     results = resolve_all(apps, jobs=args.jobs)
 
@@ -1318,35 +1392,55 @@ def main(argv: Optional[list[str]] = None) -> int:
     up_to_date = 0
     no_source = 0
     resolve_error_msgs: list[str] = []
+    failed_labels: list[str] = []
 
     for res in results:
         label = res.app.name
         if res.error:
             errors += 1
             resolve_error_msgs.append(res.error)
+            failed_labels.append(f"{label} ({res.error})")
             log_err(f"{status_tag('ERROR')} {label}: {res.error}")
             continue
         if res.skipped:
             if res.skipped.startswith("up to date"):
                 up_to_date += 1
-                log(f"{status_tag('OK')} {label}: {res.skipped}")
+                if _verbose:
+                    log(f"{status_tag('OK')} {label}: {res.skipped}")
             else:
                 no_source += 1
-                log(f"{status_tag('SKIP')} {label}: {res.skipped}")
+                if _verbose:
+                    log(f"{status_tag('SKIP')} {label}: {res.skipped}")
             continue
         if res.update:
             pending.append(res.update)
             size = format_size(res.update.remote_size)
-            log(
-                f"{status_tag('UPDATE')} {label}: {res.update.detail} "
-                f"[{res.update.method}, {size}]"
-            )
+            method = res.update.method
+            if _verbose:
+                log(
+                    f"{status_tag('UPDATE')} {label}: {res.update.detail} "
+                    f"[{method}, {size}]"
+                )
+            else:
+                log(f"{status_tag('UPDATE')} {label:<28} {size:>10}   {method}")
 
-    log()
-    log(
-        f"Summary: {len(pending)} to update, {up_to_date} up to date, "
-        f"{no_source} skipped, {errors} errors"
-    )
+    # Collapsed counts (default / non-verbose)
+    if not _quiet:
+        bits: list[str] = []
+        if up_to_date:
+            bits.append(f"{up_to_date} up to date")
+        if no_source:
+            bits.append(f"{no_source} skipped (no update URL)")
+        if errors:
+            bits.append(f"{errors} errors")
+        if bits and not _verbose:
+            log("  " + _paint(" · ".join(bits), _C_DIM))
+        elif _verbose:
+            log()
+            log(
+                f"Summary: {len(pending)} to update, {up_to_date} up to date, "
+                f"{no_source} skipped, {errors} errors"
+            )
 
     if not pending:
         tip = failure_tip(
@@ -1356,8 +1450,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             resolve_errors=resolve_error_msgs,
             missing_aria2=False,
         )
-        if tip and (errors or no_source):
+        if tip and (errors or (no_source and _verbose)):
             log(tip)
+        if _topgrade:
+            topgrade_line(
+                format_topgrade_summary(
+                    updated=[],
+                    failed=failed_labels,
+                    nothing=True,
+                )
+            )
         return EXIT_PARTIAL if errors else EXIT_OK
 
     log()
@@ -1374,9 +1476,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         if tip and (errors or no_source):
             log(tip)
+        if _topgrade:
+            names = [u.app.name for u in pending]
+            topgrade_line(f"Would update: {', '.join(names)}.")
         return EXIT_PARTIAL if errors else EXIT_OK
 
-    if not confirm_download(pending, yes=bool(args.yes)):
+    if not confirm_download(pending, yes=yes):
         log("Aborted — no downloads performed.")
         return EXIT_OK
 
@@ -1392,10 +1497,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         log(f"Delta-updating {upd.app.name} with appimageupdatetool…")
         try:
             apply_zsync_update(upd.app.file_path)
-            log(f"  Updated {upd.app.name} (zsync)")
             updated_names.append(upd.app.name)
+            if _verbose:
+                log(f"  Updated {upd.app.name} (zsync)")
         except RuntimeError as exc:
             apply_errors.append(str(exc))
+            failed_labels.append(f"{upd.app.name} ({exc})")
             log_err(f"{status_tag('ERROR')} {exc}")
 
     if aria_updates:
@@ -1404,6 +1511,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             msg = f"aria2c not found on PATH. Install it with: {aria2_install_hint()}"
             log_err(msg)
             apply_errors.append(msg)
+            for upd in aria_updates:
+                failed_labels.append(f"{upd.app.name} (aria2c missing)")
         else:
             staging = Path(tempfile.mkdtemp(prefix="gearlever-turbo-"))
             try:
@@ -1422,9 +1531,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 apply_errors.extend(new_errs)
                 for msg in new_errs:
                     log_err(f"{status_tag('ERROR')} {msg}")
-                failed_names = {
-                    e.split(":", 1)[0] for e in new_errs if ":" in e
-                }
+                    if ":" in msg:
+                        failed_labels.append(msg.replace(": ", " (", 1) + ")")
+                failed_names = {e.split(":", 1)[0] for e in new_errs if ":" in e}
                 for upd in aria_updates:
                     if upd.app.name not in failed_names:
                         updated_names.append(upd.app.name)
@@ -1441,14 +1550,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         if tip:
             log(tip)
+        section_header("Done")
         if updated_names:
             log(f"Partially updated: {', '.join(updated_names)}")
+        if _topgrade:
+            topgrade_line(
+                format_topgrade_summary(
+                    updated=updated_names,
+                    failed=failed_labels,
+                    nothing=False,
+                )
+            )
         return EXIT_SETUP if missing_aria2 and not updated_names else EXIT_PARTIAL
 
+    section_header("Done")
     if updated_names:
         log(f"All updates applied: {', '.join(updated_names)}")
     else:
         log("All updates applied.")
+    if _topgrade:
+        topgrade_line(
+            format_topgrade_summary(
+                updated=updated_names,
+                failed=[],
+                nothing=not updated_names,
+            )
+        )
     return EXIT_OK
 
 

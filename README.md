@@ -28,7 +28,7 @@ gearlever-turbo --check
 gearlever-turbo
 ```
 
-On an interactive terminal, the default run shows a download plan (with total size) and asks before downloading. Use `--yes` to skip the prompt, or `--quiet` for cron/systemd.
+On an interactive terminal, the default run shows a compact update list and plan, then asks before downloading. OK/SKIP rows are collapsed into counts (use `-v` to expand). Aria2 progress is shown without redirect spam. Use `--yes` to skip the prompt, `--quiet` for cron/systemd, or `--topgrade` for a one-line Topgrade-friendly summary.
 
 ## What it does
 
@@ -75,9 +75,11 @@ cp gearlever-turbo ~/.local/bin/
 ## Usage
 
 ```bash
-gearlever-turbo              # Check, confirm, then update
+gearlever-turbo              # Check, confirm, then update (pretty TTY UI)
+gearlever-turbo -v           # Show every OK / SKIP row
 gearlever-turbo --check      # Show what would update (alias: --dry-run)
 gearlever-turbo --yes        # Update without confirmation prompt
+gearlever-turbo --topgrade   # Quiet + one summary line (Topgrade / automation)
 gearlever-turbo --quiet      # Quiet mode for cron / systemd timers
 gearlever-turbo --jobs 8 --connections 16
 gearlever-turbo --help
@@ -87,14 +89,26 @@ gearlever-turbo --help
 |---|---|
 | `--check` / `--dry-run` | Resolve and list updates; download nothing |
 | `--yes` / `-y` | Download without asking for confirmation |
+| `--verbose` / `-v` | Show every OK / SKIP row and extra plan detail |
 | `--quiet` / `-q` | Suppress progress; errors still go to stderr (also skips confirm) |
+| `--topgrade` | Implies `--quiet` + `--yes`; prints one summary line to stdout |
 | `--jobs` / `-j` | Parallel resolve workers and concurrent aria2 downloads (default: 4) |
 | `--connections` / `-x` | aria2 connections per server (default: 16) |
 | `--config-dir DIR` | Override GearLever config directory |
 
-**Confirmation:** On a TTY, interactive runs prompt `Download N update(s) (~size)? [Y/n]` after showing the plan. Non-TTY, `--yes`, and `--quiet` skip the prompt and proceed.
+**Confirmation:** On a TTY, interactive runs prompt `Do you want to continue?` after the plan. Non-TTY, `--yes`, `--quiet`, and `--topgrade` skip the prompt and proceed.
 
-**Colors:** Status labels use ANSI colors on a TTY. Set `NO_COLOR=1` to disable.
+**Colors:** Status labels and section headers use ANSI colors on a TTY. Set `NO_COLOR=1` to disable.
+
+### Topgrade
+
+In Topgrade’s custom commands / config, prefer:
+
+```toml
+gearlever-turbo --topgrade
+```
+
+Example summary lines: `Nothing to update.` / `Updated: T3 Code (Nightly).` / `Updated: A. Failed: B (reason).`
 
 ### Exit codes
 
@@ -110,7 +124,7 @@ gearlever-turbo --help
 
 ```cron
 # Every day at 04:30
-30 4 * * * /home/YOU/.local/bin/gearlever-turbo --quiet
+30 4 * * * /home/YOU/.local/bin/gearlever-turbo --topgrade
 ```
 
 **systemd user timer** — `~/.config/systemd/user/gearlever-turbo.service`:
@@ -121,7 +135,7 @@ Description=Parallel GearLever AppImage updates
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/gearlever-turbo --quiet
+ExecStart=%h/.local/bin/gearlever-turbo --topgrade
 ```
 
 `~/.config/systemd/user/gearlever-turbo.timer`:
@@ -202,7 +216,7 @@ gearlever-turbo
 - GearLever stays in charge — only read its data, never fight it
 - Single-file, dependency-light — Python 3 stdlib + `aria2c`; optionally `appimageupdatetool`
 - Graceful degradation — metadata parsing lives in `parse_gearlever_apps()` so format changes need one place updated
-- Scriptable — `--quiet` / `--yes` and meaningful exit codes for cron/systemd
+- Scriptable — `--topgrade` / `--quiet` / `--yes` and meaningful exit codes for cron/systemd/Topgrade
 
 ## Assumptions & limitations
 
