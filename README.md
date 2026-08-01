@@ -275,6 +275,12 @@ gearlever-turbo
 - Desktop entries / icons are not rewritten; path stability is intentional so GearLever keeps working.
 - “Up to date” in GearLever is based on size/hash checks against the remote — not a separate status database. Replacing the file with the current release is enough.
 
+## Support (totally optional)
+
+This project is free, and it always will be. Nobody owes me anything for it.
+
+If you somehow still want to tip, you can [buy me a coffee](https://buymeacoffee.com/mystery2099). No pressure at all.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
